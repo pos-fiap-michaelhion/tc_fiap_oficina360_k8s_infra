@@ -23,10 +23,6 @@ output "configure_kubectl" {
   value = "aws eks update-kubeconfig --region ${var.aws_region} --name ${aws_eks_cluster.main.name}"
 }
 
-output "vpc_id" {
-  description = "ID da VPC"
-  value       = module.vpc.vpc_id
-}
 
 output "lambda_security_group_id" {
   description = "Security Group utilizado pela Lambda"
