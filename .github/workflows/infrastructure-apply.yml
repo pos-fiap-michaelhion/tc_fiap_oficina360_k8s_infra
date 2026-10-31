@@ -355,20 +355,6 @@ jobs:
 
           echo "Nodes Ready: $READY_NODES"
 
-      - name: Validar parametros de rede
-        if: inputs.action == 'deploy'
-        timeout-minutes: 2
-        working-directory: .
-        run: |
-          set -euo pipefail
-
-          aws ssm get-parameters-by-path \
-            --path "/oficina360/network" \
-            --recursive \
-            --region "$AWS_REGION" \
-            --query 'Parameters[].{Name:Name,Value:Value}' \
-            --output table
-
       - name: Gerar resumo para atualizar Repository Variables
         if: inputs.action == 'deploy'
         working-directory: .

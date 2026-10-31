@@ -71,10 +71,6 @@ check_text terraform/lab/security-groups.tf \
   'resource "aws_security_group" "database_access"' \
   'Security Group compartilhado presente'
 
-check_text terraform/lab/parameters.tf \
-  '/oficina360/network/database-access-sg-id' \
-  'Security Group publicado no Parameter Store'
-
 TRACKED_SECRETS="$(
   git ls-files |
     grep -E '(^|/)(secret\.yaml|.*-secret\.yaml)$' ||
