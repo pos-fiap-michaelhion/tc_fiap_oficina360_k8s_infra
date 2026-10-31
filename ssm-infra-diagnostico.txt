@@ -1,0 +1,61 @@
+===== REPOSITORIO =====
+/mnt/c/Users/trabalho/Desktop/tech_challengers/tc_fiap_oficina360_k8s_infra
+
+===== IMPORT BLOCKS TERRAFORM =====
+./terraform/lab/imports.tf:1:import {
+./terraform/lab/imports.tf:2:  to = aws_ssm_parameter.vpc_id
+./terraform/lab/imports.tf:6:import {
+./terraform/lab/imports.tf:7:  to = aws_ssm_parameter.subnet_ids
+./terraform/lab/imports.tf:11:import {
+./terraform/lab/imports.tf:12:  to = aws_ssm_parameter.database_access_security_group_id
+./terraform/lab/parameters.tf:1:resource "aws_ssm_parameter" "vpc_id" {
+./terraform/lab/parameters.tf:7:resource "aws_ssm_parameter" "subnet_ids" {
+./terraform/lab/parameters.tf:13:resource "aws_ssm_parameter" "database_access_security_group_id" {
+./terraform/lab/parameters.tf:19:resource "aws_ssm_parameter" "cluster_name" {
+./terraform/lab/parameters.tf:31:resource "aws_ssm_parameter" "cluster_endpoint" {
+./terraform/lab/parameters.tf:43:resource "aws_ssm_parameter" "cluster_ca" {
+
+===== COMANDOS TERRAFORM IMPORT NOS WORKFLOWS E SCRIPTS =====
+.github/workflows/infrastructure-apply.yml:366:            --path "/oficina360/network" \
+scripts/validate-platform.sh:75:  '/oficina360/network/database-access-sg-id' \
+terraform/lab/imports.tf:2:  to = aws_ssm_parameter.vpc_id
+terraform/lab/imports.tf:3:  id = "/oficina360/network/vpc-id"
+terraform/lab/imports.tf:7:  to = aws_ssm_parameter.subnet_ids
+terraform/lab/imports.tf:8:  id = "/oficina360/network/subnet-ids"
+terraform/lab/imports.tf:12:  to = aws_ssm_parameter.database_access_security_group_id
+terraform/lab/imports.tf:13:  id = "/oficina360/network/database-access-sg-id"
+terraform/lab/parameters.tf:1:resource "aws_ssm_parameter" "vpc_id" {
+terraform/lab/parameters.tf:2:  name  = "/oficina360/network/vpc-id"
+terraform/lab/parameters.tf:7:resource "aws_ssm_parameter" "subnet_ids" {
+terraform/lab/parameters.tf:8:  name  = "/oficina360/network/subnet-ids"
+terraform/lab/parameters.tf:13:resource "aws_ssm_parameter" "database_access_security_group_id" {
+terraform/lab/parameters.tf:14:  name  = "/oficina360/network/database-access-sg-id"
+terraform/lab/parameters.tf:19:resource "aws_ssm_parameter" "cluster_name" {
+terraform/lab/parameters.tf:20:  name        = "/oficina360/cluster/name"
+terraform/lab/parameters.tf:31:resource "aws_ssm_parameter" "cluster_endpoint" {
+terraform/lab/parameters.tf:32:  name        = "/oficina360/cluster/endpoint"
+terraform/lab/parameters.tf:43:resource "aws_ssm_parameter" "cluster_ca" {
+terraform/lab/parameters.tf:44:  name        = "/oficina360/cluster/certificate-authority"
+
+===== SSM AWS CLI =====
+./.github/workflows/infrastructure-apply.yml:365:          aws ssm get-parameters-by-path \
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1653:-  OUT="$(aws ssm get-parameter --name "$parameter" --region "$AWS_REGION" --query 'Parameter.Value' --output text 2>&1)"
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1693:-    warn "Workflow ainda depende de ssm:GetParameter para dados do banco"
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1727:-      fail "Ultimo run falhou por ssm:GetParameter"
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1772:-  log "CAUSA RAIZ: a politica do Learner Lab possui explicit deny para ssm:GetParameter."
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1785:-  log "No step Deploy, substitua os tres aws ssm get-parameter por:"
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1794:-  log "Nenhum deny de ssm:GetParameter foi confirmado nesta execucao."
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1883:-125:          DB_HOST="$(aws ssm get-parameter \
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1885:-130:          DB_PORT="$(aws ssm get-parameter \
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1887:-135:          DB_NAME="$(aws ssm get-parameter \
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1898:-[WARN] Workflow ainda depende de ssm:GetParameter para dados do banco
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1913:-application	Deploy	2026-10-19T00:21:07.5177893Z [36;1mDB_HOST="$(aws ssm get-parameter \[0m
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1918:-application	Deploy	2026-10-19T00:21:07.5178707Z [36;1mDB_PORT="$(aws ssm get-parameter \[0m
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1923:-application	Deploy	2026-10-19T00:21:07.5179530Z [36;1mDB_NAME="$(aws ssm get-parameter \[0m
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1973:-application	Deploy	2026-10-19T00:21:08.1525720Z aws: [ERROR]: An error occurred (AccessDeniedException) when calling the GetParameter operation: User: arn:aws:sts::337958928021:assumed-role/voclabs/user5231828=michael.hion@outlook.com is not authorized to perform: ssm:GetParameter on resource: arn:aws:ssm:us-east-1:337958928021:parameter/oficina360/database/host with an explicit deny in an identity-based policy: arn:aws:iam::337958928021:policy/voc-cancel-cred
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1975:-[ERRO] Ultimo run falhou por ssm:GetParameter
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:1999:-CAUSA RAIZ: a politica do Learner Lab possui explicit deny para ssm:GetParameter.
+./.idea/shelf/Uncommitted_changes_before_Update_at_26_10_2026_23_22_[Changes]/shelved.patch:2008:-No step Deploy, substitua os tres aws ssm get-parameter por:
+./diagnosticar-remover-ssm-infra.sh:27:  grep -Rni -E 'aws[[:space:]]+ssm|ssm:(Get|Put|Delete)|get-parameter|put-parameter|delete-parameter' \
+
+===== STATE SSM =====
