@@ -1,0 +1,42 @@
+name: Testar credenciais AWS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validar disponibilidade dos Secrets
+        env:
+          ACCESS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          SECRET_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          : "${ACCESS_KEY:?AWS_ACCESS_KEY_ID nao disponivel}"
+          : "${SECRET_KEY:?AWS_SECRET_ACCESS_KEY nao disponivel}"
+          : "${SESSION_TOKEN:?AWS_SESSION_TOKEN nao disponivel}"
+
+          echo "Os tres Secrets AWS estao disponiveis."
+
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Validar identidade
+        run: |
+          set -euo pipefail
+
+          aws sts get-caller-identity \
+            --query '{Account:Account,Arn:Arn}' \
+            --output table
