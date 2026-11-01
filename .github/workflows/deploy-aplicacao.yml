@@ -1,8 +1,6 @@
 name: Aplicacao
 
-run-name: >-
-  Aplicacao - ${{ inputs.action }} -
-  ${{ inputs.image || vars.DEFAULT_APP_IMAGE || 'michaelhion/oficina360:latest' }}
+run-name: Aplicacao - ${{ inputs.action }}
 
 on:
   workflow_dispatch:
@@ -17,7 +15,7 @@ on:
           - destroy
 
       image:
-        description: Imagem opcional. Se vazia, usa DEFAULT_APP_IMAGE ou michaelhion/oficina360:latest
+        description: Imagem opcional. Se vazia, usa DEFAULT_APP_IMAGE
         required: false
         type: string
 
@@ -31,6 +29,7 @@ concurrency:
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
   NAMESPACE: oficina360
+  PROJECT_NAME: oficina360
   DEFAULT_APP_IMAGE: ${{ vars.DEFAULT_APP_IMAGE || 'michaelhion/oficina360:latest' }}
 
 jobs:
@@ -54,7 +53,7 @@ jobs:
           : "${IMAGE:?Nenhuma imagem foi informada e DEFAULT_APP_IMAGE nao esta definida}"
 
           if [[ "$IMAGE" =~ [[:space:]] ]]; then
-            echo "::error::Informe somente a referencia da imagem, sem docker pull ou espacos."
+            echo "::error::Informe somente a referencia da imagem, sem comandos ou espacos."
             exit 1
           fi
 
@@ -67,22 +66,22 @@ jobs:
             echo "::warning::Usando tag latest. O deploy nao sera reprodutivel."
           else
             echo "::error::Formato de imagem invalido."
-            echo "::error::Use usuario/repositorio:<git-sha>, usuario/repositorio@sha256:<digest> ou usuario/repositorio:latest."
             exit 1
           fi
 
+          echo "::add-mask::$IMAGE"
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
           echo "IMAGE_MODE=$IMAGE_MODE" >> "$GITHUB_ENV"
-          echo "Imagem resolvida: $IMAGE"
-          echo "Modo: $IMAGE_MODE"
 
-      - name: Mostrar parametros da execucao
+          echo "Imagem validada."
+          echo "Modo da imagem: $IMAGE_MODE"
+
+      - name: Mostrar parametros sanitizados
         run: |
-          echo "action=${{ inputs.action }}"
-          echo "input_image=${{ inputs.image || 'nao informada' }}"
-          echo "default_image=$DEFAULT_APP_IMAGE"
-          echo "branch=${GITHUB_REF_NAME}"
-          echo "commit=${GITHUB_SHA}"
+          set -euo pipefail
+          echo "Acao: ${{ inputs.action }}"
+          echo "Regiao configurada."
+          echo "Parametros sensiveis e identificadores foram omitidos."
 
       - name: Instalar kubeconform
         if: inputs.action == 'validate'
@@ -101,7 +100,7 @@ jobs:
       - name: Validar manifests
         if: inputs.action == 'validate'
         env:
-          IMAGE: docker.io/michaelhion/oficina360-api:0123456
+          IMAGE: docker.io/example/oficina360-api:0123456
         run: |
           set -euo pipefail
 
@@ -127,14 +126,76 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Configurar acesso ao EKS
+      - name: Validar identidade AWS sem expor dados
         if: inputs.action == 'deploy' || inputs.action == 'destroy'
-        env:
-          EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
         run: |
           set -euo pipefail
 
-          : "${EKS_CLUSTER_NAME:?Repository Variable EKS_CLUSTER_NAME nao definida}"
+          IDENTITY_JSON="$(aws sts get-caller-identity --output json)"
+          ACCOUNT_ID="$(jq -r '.Account' <<< "$IDENTITY_JSON")"
+          CALLER_ARN="$(jq -r '.Arn' <<< "$IDENTITY_JSON")"
+          USER_ID="$(jq -r '.UserId' <<< "$IDENTITY_JSON")"
+
+          : "${ACCOUNT_ID:?Conta AWS nao identificada}"
+          : "${CALLER_ARN:?Caller ARN nao identificado}"
+          : "${USER_ID:?User ID nao identificado}"
+
+          echo "::add-mask::$ACCOUNT_ID"
+          echo "::add-mask::$CALLER_ARN"
+          echo "::add-mask::$USER_ID"
+          echo "::add-mask::${CALLER_ARN##*/}"
+
+          echo "Identidade AWS validada."
+
+      - name: Descobrir e configurar cluster EKS atual
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        run: |
+          set -euo pipefail
+
+          mapfile -t CLUSTERS < <(
+            aws eks list-clusters \
+              --region "$AWS_REGION" \
+              --query 'clusters[]' \
+              --output text |
+            tr '\t' '\n' |
+            sed '/^$/d'
+          )
+
+          [[ "${#CLUSTERS[@]}" -gt 0 ]] || {
+            echo "::error::Nenhum cluster EKS encontrado na regiao configurada."
+            exit 1
+          }
+
+          CANDIDATES=()
+
+          for cluster_name in "${CLUSTERS[@]}"; do
+            CLUSTER_JSON="$(
+              aws eks describe-cluster \
+                --name "$cluster_name" \
+                --region "$AWS_REGION" \
+                --output json
+            )"
+
+            CLUSTER_PROJECT="$(jq -r '.cluster.tags.Project // empty' <<< "$CLUSTER_JSON")"
+            CLUSTER_ENVIRONMENT="$(jq -r '.cluster.tags.Environment // empty' <<< "$CLUSTER_JSON")"
+
+            if [[ "$cluster_name" == "$PROJECT_NAME" ]] ||
+               [[ "$CLUSTER_PROJECT" == "$PROJECT_NAME" && "$CLUSTER_ENVIRONMENT" == "lab" ]]; then
+              CANDIDATES+=("$cluster_name")
+            fi
+          done
+
+          if [[ "${#CANDIDATES[@]}" -eq 0 && "${#CLUSTERS[@]}" -eq 1 ]]; then
+            CANDIDATES=("${CLUSTERS[0]}")
+          fi
+
+          [[ "${#CANDIDATES[@]}" -eq 1 ]] || {
+            echo "::error::Nao foi possivel selecionar um unico cluster EKS."
+            exit 1
+          }
+
+          EKS_CLUSTER_NAME="${CANDIDATES[0]}"
+          echo "::add-mask::$EKS_CLUSTER_NAME"
 
           CLUSTER_STATUS="$(
             aws eks describe-cluster \
@@ -144,38 +205,40 @@ jobs:
               --output text
           )"
 
-          if [[ "$CLUSTER_STATUS" != "ACTIVE" ]]; then
-            echo "::error::Cluster EKS nao esta ACTIVE. Status: $CLUSTER_STATUS"
+          [[ "$CLUSTER_STATUS" == "ACTIVE" ]] || {
+            echo "::error::O cluster EKS nao esta ACTIVE."
             exit 1
-          fi
+          }
 
-          export KUBECONFIG="$RUNNER_TEMP/oficina360-kubeconfig"
-          rm -f "$KUBECONFIG"
-          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
+          KUBECONFIG_PATH="$RUNNER_TEMP/oficina360-kubeconfig"
+          rm -f "$KUBECONFIG_PATH"
+
+          echo "KUBECONFIG=$KUBECONFIG_PATH" >> "$GITHUB_ENV"
+          echo "EKS_CLUSTER_NAME=$EKS_CLUSTER_NAME" >> "$GITHUB_ENV"
 
           aws eks update-kubeconfig \
             --name "$EKS_CLUSTER_NAME" \
             --region "$AWS_REGION" \
             --alias oficina360 \
-            --kubeconfig "$KUBECONFIG"
+            --kubeconfig "$KUBECONFIG_PATH" \
+            >/dev/null
 
-          kubectl config current-context
-          kubectl cluster-info
-          kubectl get nodes
+          kubectl auth can-i get namespaces >/dev/null
+          echo "Acesso ao cluster configurado."
 
       - name: Verificar permissoes Kubernetes
         if: inputs.action == 'deploy' || inputs.action == 'destroy'
         run: |
           set -euo pipefail
 
-          kubectl config current-context
-          kubectl get nodes -o wide
-          kubectl auth can-i get namespaces
+          kubectl auth can-i get namespaces >/dev/null
 
           if [[ "${{ inputs.action }}" == "deploy" ]]; then
-            kubectl auth can-i create namespaces
-            kubectl auth can-i create deployments --namespace "$NAMESPACE"
+            kubectl auth can-i create namespaces >/dev/null
+            kubectl auth can-i create deployments --namespace "$NAMESPACE" >/dev/null
           fi
+
+          echo "Permissoes Kubernetes validadas."
 
       - name: Deploy
         if: inputs.action == 'deploy'
@@ -194,6 +257,12 @@ jobs:
           : "${DB_PASSWORD:?GitHub Secret DB_PASSWORD nao definido}"
           : "${JWT_SECRET:?GitHub Secret JWT_SECRET nao definido}"
 
+          echo "::add-mask::$DATABASE_URL"
+          echo "::add-mask::$DB_USERNAME"
+          echo "::add-mask::$DB_PASSWORD"
+          echo "::add-mask::$JWT_SECRET"
+          echo "::add-mask::$IMAGE"
+
           if [[ ! "$DATABASE_URL" =~ ^jdbc:postgresql://([^/:]+):([0-9]+)/([^/?]+)$ ]]; then
             echo "::error::DATABASE_URL deve usar jdbc:postgresql://host:porta/banco"
             exit 1
@@ -203,16 +272,11 @@ jobs:
           DATABASE_PORT="${BASH_REMATCH[2]}"
           DATABASE_NAME="${BASH_REMATCH[3]}"
 
-          echo "::add-mask::$DB_USERNAME"
-          echo "::add-mask::$DB_PASSWORD"
+          echo "::add-mask::$DATABASE_HOST"
+          echo "::add-mask::$DATABASE_PORT"
+          echo "::add-mask::$DATABASE_NAME"
 
-          echo "Banco configurado:"
-          echo "Host: $DATABASE_HOST"
-          echo "Porta: $DATABASE_PORT"
-          echo "Database: $DATABASE_NAME"
-
-          kubectl apply -f k8s/aws/namespace.yaml
-          kubectl get namespace "$NAMESPACE"
+          kubectl apply -f k8s/aws/namespace.yaml >/dev/null
 
           kubectl create configmap oficina360-config \
             --namespace "$NAMESPACE" \
@@ -223,7 +287,7 @@ jobs:
             --from-literal=SERVER_PORT=8081 \
             --dry-run=client \
             --output yaml |
-            kubectl apply -f -
+            kubectl apply -f - >/dev/null
 
           kubectl create secret generic oficina360-secret \
             --namespace "$NAMESPACE" \
@@ -232,21 +296,21 @@ jobs:
             --from-literal=JWT_SECRET="$JWT_SECRET" \
             --dry-run=client \
             --output yaml |
-            kubectl apply -f -
+            kubectl apply -f - >/dev/null
 
           export IMAGE
           envsubst '${IMAGE}' \
             < k8s/aws/api-deployment.yaml \
             > /tmp/api-deployment.yaml
 
-          kubectl apply -f /tmp/api-deployment.yaml
-          kubectl apply -f k8s/aws/api-service.yaml
+          kubectl apply -f /tmp/api-deployment.yaml >/dev/null
+          kubectl apply -f k8s/aws/api-service.yaml >/dev/null
 
           if [[ "$IMAGE_MODE" == "latest" ]]; then
-            echo "Tag latest detectada. Forcando novo rollout para consultar o registry."
             kubectl rollout restart \
               deployment/oficina360-api \
-              --namespace "$NAMESPACE"
+              --namespace "$NAMESPACE" \
+              >/dev/null
           fi
 
           kubectl rollout status \
@@ -260,27 +324,19 @@ jobs:
               --output jsonpath='{.spec.template.spec.containers[0].image}'
           )"
 
-          echo "Imagem solicitada: $IMAGE"
-          echo "Imagem implantada: $DEPLOYED_IMAGE"
+          echo "::add-mask::$DEPLOYED_IMAGE"
 
-          if [[ "$DEPLOYED_IMAGE" != "$IMAGE" ]]; then
+          [[ "$DEPLOYED_IMAGE" == "$IMAGE" ]] || {
             echo "::error::Imagem implantada diferente da imagem solicitada."
             exit 1
-          fi
+          }
 
-          kubectl get deployment,pod,service \
-            --namespace "$NAMESPACE" \
-            --output wide
+          echo "Aplicacao implantada com sucesso."
 
       - name: Verificar deploy
         if: inputs.action == 'deploy'
         run: |
           set -euo pipefail
-
-          kubectl get namespace "$NAMESPACE"
-          kubectl get configmap oficina360-config --namespace "$NAMESPACE"
-          kubectl get secret oficina360-secret --namespace "$NAMESPACE"
-          kubectl get service oficina360-api --namespace "$NAMESPACE"
 
           kubectl rollout status \
             deployment/oficina360-api \
@@ -310,6 +366,8 @@ jobs:
           }
 
           echo "Deploy validado com sucesso."
+          echo "Replicas prontas: $READY_REPLICAS"
+          echo "Replicas disponiveis: $AVAILABLE_REPLICAS"
 
       - name: Destroy
         if: inputs.action == 'destroy'
@@ -319,72 +377,83 @@ jobs:
           kubectl delete namespace "$NAMESPACE" \
             --ignore-not-found=true \
             --wait=true \
-            --timeout=5m
+            --timeout=5m \
+            >/dev/null
 
           if kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
-            echo "::error::Namespace $NAMESPACE ainda existe."
+            echo "::error::Namespace ainda existe."
             exit 1
           fi
 
-          echo "Namespace $NAMESPACE removido."
+          echo "Namespace removido."
 
-      - name: Gerar diagnostico
-        if: always() && inputs.action != 'validate'
+      - name: Gerar diagnostico sanitizado
+        if: failure() && inputs.action != 'validate'
         run: |
+          set -euo pipefail
+
+          NAMESPACE_EXISTS="false"
+          DEPLOYMENT_EXISTS="false"
+          READY_REPLICAS="0"
+          AVAILABLE_REPLICAS="0"
+          POD_COUNT="0"
+          FAILED_POD_COUNT="0"
+
+          if kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
+            NAMESPACE_EXISTS="true"
+          fi
+
+          if kubectl get deployment oficina360-api \
+            --namespace "$NAMESPACE" \
+            >/dev/null 2>&1; then
+
+            DEPLOYMENT_EXISTS="true"
+            READY_REPLICAS="$(
+              kubectl get deployment oficina360-api \
+                --namespace "$NAMESPACE" \
+                --output jsonpath='{.status.readyReplicas}' 2>/dev/null ||
+              echo 0
+            )"
+            AVAILABLE_REPLICAS="$(
+              kubectl get deployment oficina360-api \
+                --namespace "$NAMESPACE" \
+                --output jsonpath='{.status.availableReplicas}' 2>/dev/null ||
+              echo 0
+            )"
+          fi
+
+          POD_COUNT="$(
+            kubectl get pods \
+              --namespace "$NAMESPACE" \
+              --selector app=oficina360-api \
+              --no-headers 2>/dev/null |
+            wc -l |
+            tr -d ' '
+          )"
+
+          FAILED_POD_COUNT="$(
+            kubectl get pods \
+              --namespace "$NAMESPACE" \
+              --selector app=oficina360-api \
+              --field-selector=status.phase=Failed \
+              --no-headers 2>/dev/null |
+            wc -l |
+            tr -d ' '
+          )"
+
           {
-            echo "===== EXECUCAO ====="
+            echo "status=failure"
             echo "action=${{ inputs.action }}"
-            echo "branch=${GITHUB_REF_NAME}"
-            echo "commit=${GITHUB_SHA}"
-            echo "image=${IMAGE:-nao resolvida}"
+            echo "namespace_exists=$NAMESPACE_EXISTS"
+            echo "deployment_exists=$DEPLOYMENT_EXISTS"
+            echo "ready_replicas=${READY_REPLICAS:-0}"
+            echo "available_replicas=${AVAILABLE_REPLICAS:-0}"
+            echo "pod_count=${POD_COUNT:-0}"
+            echo "failed_pod_count=${FAILED_POD_COUNT:-0}"
+          } > application-diagnostics.txt
 
-            echo
-            echo "===== CONTEXTO ====="
-            kubectl config current-context || true
-
-            echo
-            echo "===== NODES ====="
-            kubectl get nodes -o wide || true
-
-            echo
-            echo "===== NAMESPACE ====="
-            kubectl get namespace "$NAMESPACE" || true
-
-            echo
-            echo "===== WORKLOADS ====="
-            kubectl get all --namespace "$NAMESPACE" --output wide || true
-
-            echo
-            echo "===== CONFIGMAP ====="
-            kubectl get configmap oficina360-config --namespace "$NAMESPACE" || true
-
-            echo
-            echo "===== SECRET KEYS ====="
-            kubectl get secret oficina360-secret \
-              --namespace "$NAMESPACE" \
-              --output json 2>/dev/null |
-              jq -r '.data | keys[]' || true
-
-            echo
-            echo "===== EVENTS ====="
-            kubectl get events \
-              --namespace "$NAMESPACE" \
-              --sort-by=.lastTimestamp || true
-
-            echo
-            echo "===== DEPLOYMENT DESCRIPTION ====="
-            kubectl describe deployment oficina360-api \
-              --namespace "$NAMESPACE" || true
-
-            echo
-            echo "===== POD DESCRIPTIONS ====="
-            kubectl describe pods \
-              --namespace "$NAMESPACE" \
-              --selector app=oficina360-api || true
-          } > application-diagnostics.txt 2>&1
-
-      - name: Publicar diagnostico
-        if: always() && inputs.action != 'validate'
+      - name: Publicar diagnostico sanitizado
+        if: failure() && inputs.action != 'validate'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: application-diagnostics
