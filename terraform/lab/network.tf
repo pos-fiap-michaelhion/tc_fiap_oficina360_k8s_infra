@@ -7,10 +7,10 @@ module "vpc" {
   version = "6.7.3"
 
   name = "${var.project_name}-vpc"
-  cidr = "10.42.0.0/16"
+  cidr = var.vpc_cidr
 
   azs            = local.azs
-  public_subnets = ["10.42.0.0/20", "10.42.16.0/20"]
+  public_subnets = var.public_subnet_cidrs
 
   enable_nat_gateway      = false
   map_public_ip_on_launch = true
@@ -21,5 +21,10 @@ module "vpc" {
   public_subnet_tags = {
     "kubernetes.io/role/elb"                    = "1"
     "kubernetes.io/cluster/${var.project_name}" = "shared"
+  }
+
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
   }
 }

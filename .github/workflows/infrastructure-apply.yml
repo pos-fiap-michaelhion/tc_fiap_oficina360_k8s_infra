@@ -20,7 +20,7 @@ on:
         type: string
 
       allow_cluster_replacement:
-        description: Permitir recriar o cluster apos reset do Learner Lab
+        description: Permitir recriar recursos EKS apos reset do Learner Lab
         required: true
         default: false
         type: boolean
@@ -44,7 +44,7 @@ jobs:
   infrastructure:
     name: Infrastructure ${{ inputs.action }}
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 60
 
     defaults:
       run:
@@ -64,6 +64,7 @@ jobs:
       - name: Mostrar parametros da execucao
         working-directory: .
         run: |
+          set -euo pipefail
           echo "action=${{ inputs.action }}"
           echo "kubernetes_version=${{ inputs.kubernetes_version }}"
           echo "allow_cluster_replacement=${{ inputs.allow_cluster_replacement }}"
@@ -80,8 +81,8 @@ jobs:
       - name: Terraform validate
         if: inputs.action == 'validate'
         env:
-          TF_VAR_eks_cluster_role_arn: arn:aws:iam::000000000000:role/validation-LabEksClusterRole-x
-          TF_VAR_eks_node_role_arn: arn:aws:iam::000000000000:role/validation-LabEksNodeRole-x
+          TF_VAR_eks_cluster_role_arn: arn:aws:iam::000000000000:role/LabEksClusterRole
+          TF_VAR_eks_node_role_arn: arn:aws:iam::000000000000:role/LabEksNodeRole
         run: terraform validate
 
       - name: Configure AWS credentials
@@ -101,52 +102,42 @@ jobs:
           set -euo pipefail
           aws sts get-caller-identity
 
-      - name: Configurar roles EKS
+      - name: Resolver roles EKS da conta atual
         if: inputs.action == 'deploy'
-        timeout-minutes: 1
+        timeout-minutes: 2
         working-directory: .
         env:
-          EKS_CLUSTER_ROLE_ARN: ${{ vars.EKS_CLUSTER_ROLE_ARN }}
-          EKS_NODE_ROLE_ARN: ${{ vars.EKS_NODE_ROLE_ARN }}
+          EKS_CLUSTER_ROLE_ARN_CONFIGURED: ${{ vars.EKS_CLUSTER_ROLE_ARN }}
+          EKS_NODE_ROLE_ARN_CONFIGURED: ${{ vars.EKS_NODE_ROLE_ARN }}
+          EKS_CLUSTER_ROLE_NAME: ${{ vars.EKS_CLUSTER_ROLE_NAME || 'LabEksClusterRole' }}
+          EKS_NODE_ROLE_NAME: ${{ vars.EKS_NODE_ROLE_NAME || 'LabEksNodeRole' }}
         run: |
           set -euo pipefail
-
-          : "${EKS_CLUSTER_ROLE_ARN:?Repository Variable EKS_CLUSTER_ROLE_ARN nao definida}"
-          : "${EKS_NODE_ROLE_ARN:?Repository Variable EKS_NODE_ROLE_ARN nao definida}"
-
-          if [[ ! "$EKS_CLUSTER_ROLE_ARN" =~ ^arn:aws:iam::[0-9]{12}:role/.+LabEksClusterRole.*$ ]]; then
-            echo "::error::EKS_CLUSTER_ROLE_ARN nao aponta para uma LabEksClusterRole valida."
-            exit 1
-          fi
-
-          if [[ ! "$EKS_NODE_ROLE_ARN" =~ ^arn:aws:iam::[0-9]{12}:role/.+LabEksNodeRole.*$ ]]; then
-            echo "::error::EKS_NODE_ROLE_ARN nao aponta para uma LabEksNodeRole valida."
-            exit 1
-          fi
-
-          if [[ "$EKS_CLUSTER_ROLE_ARN" == "$EKS_NODE_ROLE_ARN" ]]; then
-            echo "::error::As roles do cluster e do node group nao podem ser iguais."
-            exit 1
-          fi
-
-          echo "TF_VAR_eks_cluster_role_arn=$EKS_CLUSTER_ROLE_ARN" >> "$GITHUB_ENV"
-          echo "TF_VAR_eks_node_role_arn=$EKS_NODE_ROLE_ARN" >> "$GITHUB_ENV"
-
-          echo "Cluster role: ${EKS_CLUSTER_ROLE_ARN##*/}"
-          echo "Node role: ${EKS_NODE_ROLE_ARN##*/}"
+          bash scripts/resolve-lab-roles.sh
 
       - name: Configurar backend Terraform
         if: inputs.action == 'deploy'
-        timeout-minutes: 1
+        timeout-minutes: 2
         working-directory: .
         env:
-          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
-          TF_STATE_KEY: ${{ vars.TF_STATE_KEY || 'oficina360/lab.tfstate' }}
+          TF_STATE_BUCKET_CONFIGURED: ${{ vars.TF_STATE_BUCKET }}
+          TF_STATE_KEY_CONFIGURED: ${{ vars.TF_STATE_KEY }}
         run: |
           set -euo pipefail
 
-          : "${TF_STATE_BUCKET:?Repository Variable TF_STATE_BUCKET nao definida}"
-          : "${TF_STATE_KEY:?Repository Variable TF_STATE_KEY nao definida}"
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          TF_STATE_BUCKET="${TF_STATE_BUCKET_CONFIGURED:-oficina360-tfstate-${ACCOUNT_ID}-${AWS_REGION}}"
+          TF_STATE_KEY="${TF_STATE_KEY_CONFIGURED:-oficina360/lab.tfstate}"
+
+          : "${TF_STATE_BUCKET:?Nao foi possivel resolver TF_STATE_BUCKET}"
+          : "${TF_STATE_KEY:?Nao foi possivel resolver TF_STATE_KEY}"
+
+          if ! aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/tmp/backend-error.txt; then
+            echo "::error::Bucket de state indisponivel: $TF_STATE_BUCKET"
+            cat /tmp/backend-error.txt
+            echo "::error::O backend deve existir antes do terraform init."
+            exit 1
+          fi
 
           echo "TF_STATE_BUCKET=$TF_STATE_BUCKET" >> "$GITHUB_ENV"
           echo "TF_STATE_KEY=$TF_STATE_KEY" >> "$GITHUB_ENV"
@@ -190,48 +181,50 @@ jobs:
             'Plan:|will be imported|will be created|will be updated|will be destroyed|must be replaced' \
             /tmp/tfplan.txt || true
 
-          CLUSTER_REPLACEMENT="false"
-          if grep -q 'aws_eks_cluster.main must be replaced' /tmp/tfplan.txt; then
-            CLUSTER_REPLACEMENT="true"
+          mapfile -t DESTRUCTIVE_RESOURCES < <(
+            sed -nE \
+              's/^  # ([^ ]+) (will be destroyed|must be replaced)$/\1/p' \
+              /tmp/tfplan.txt
+          )
+
+          if [[ "${#DESTRUCTIVE_RESOURCES[@]}" -gt 0 ]]; then
+            echo "===== RECURSOS DESTRUTIVOS ====="
+            printf '%s\n' "${DESTRUCTIVE_RESOURCES[@]}"
 
             if [[ "$ALLOW_CLUSTER_REPLACEMENT" != "true" ]]; then
-              echo "::error::O plano tenta substituir o cluster EKS."
-              echo "::error::Execute novamente com allow_cluster_replacement=true somente apos revisar o plano."
+              echo "::error::O plano contem destruicoes ou substituicoes."
+              echo "::error::Revise o plano e execute novamente com allow_cluster_replacement=true."
               exit 1
             fi
 
-            echo "::warning::Substituicao do cluster autorizada explicitamente."
+            UNEXPECTED_DESTRUCTIVE="false"
+            for resource in "${DESTRUCTIVE_RESOURCES[@]}"; do
+              case "$resource" in
+                aws_eks_cluster.main|aws_eks_node_group.main|aws_eks_addon.*)
+                  echo "::warning::Substituicao EKS autorizada: $resource"
+                  ;;
+                *)
+                  echo "::error::Recurso destrutivo nao autorizado: $resource"
+                  UNEXPECTED_DESTRUCTIVE="true"
+                  ;;
+              esac
+            done
+
+            if [[ "$UNEXPECTED_DESTRUCTIVE" == "true" ]]; then
+              exit 1
+            fi
           fi
 
-          DESTROY_COUNT="$(
-            sed -nE \
-              's/^Plan: [0-9]+ to add, [0-9]+ to change, ([0-9]+) to destroy\.$/\1/p' \
-              /tmp/tfplan.txt |
-            tail -n 1
-          )"
-          DESTROY_COUNT="${DESTROY_COUNT:-0}"
+          if grep -Eq '^  # module\.vpc\..* (will be destroyed|must be replaced)$' \
+            /tmp/tfplan.txt; then
+            echo "::error::O plano tenta destruir ou substituir recursos da VPC."
+            exit 1
+          fi
 
-          if [[ "$DESTROY_COUNT" -gt 0 ]]; then
-            if [[ "$ALLOW_CLUSTER_REPLACEMENT" != "true" ]]; then
-              echo "::error::O plano contem $DESTROY_COUNT recurso(s) para destruir."
-              exit 1
-            fi
-
-            if [[ "$CLUSTER_REPLACEMENT" != "true" ]]; then
-              echo "::error::Ha destruicoes, mas nenhuma corresponde a substituicao esperada do cluster."
-              exit 1
-            fi
-
-            UNEXPECTED_DESTROYS="$(
-              grep -E '^  # .* (will be destroyed|must be replaced)' /tmp/tfplan.txt |
-              grep -v '^  # aws_eks_cluster.main must be replaced' || true
-            )"
-
-            if [[ -n "$UNEXPECTED_DESTROYS" ]]; then
-              echo "::error::O plano contem destruicoes alem do cluster EKS:"
-              echo "$UNEXPECTED_DESTROYS"
-              exit 1
-            fi
+          if grep -Eq '^  # aws_security_group\.database_access (will be destroyed|must be replaced)$' \
+            /tmp/tfplan.txt; then
+            echo "::error::O plano tenta destruir ou substituir o Security Group compartilhado."
+            exit 1
           fi
 
           PLANNED_NODE_ROLE="$(
@@ -241,7 +234,8 @@ jobs:
             head -n 1
           )"
 
-          if grep -q 'aws_eks_node_group.main will be created' /tmp/tfplan.txt; then
+          if grep -Eq '^  # aws_eks_node_group\.main (will be created|must be replaced)$' \
+            /tmp/tfplan.txt; then
             if [[ -z "$PLANNED_NODE_ROLE" ]]; then
               echo "::error::Nao foi possivel localizar node_role_arn no plano."
               exit 1
@@ -249,89 +243,35 @@ jobs:
 
             echo "Node role planejada: ${PLANNED_NODE_ROLE##*/}"
 
-            if [[ "$PLANNED_NODE_ROLE" != *LabEksNodeRole* ]]; then
-              echo "::error::O node group nao esta usando uma LabEksNodeRole."
-              echo "::error::Valor planejado: ${PLANNED_NODE_ROLE##*/}"
-              exit 1
-            fi
-
             if [[ "$PLANNED_NODE_ROLE" == *LabEksClusterRole* ]]; then
               echo "::error::Uma cluster role foi configurada no node group."
               exit 1
             fi
           else
-            echo "Node group nao sera criado neste plano ou ja existe no state."
-          fi
-
-          if grep -Eq '^  # module\.vpc\..* (will be destroyed|must be replaced)' /tmp/tfplan.txt; then
-            echo "::error::O plano tenta destruir ou substituir recursos da VPC."
-            exit 1
-          fi
-
-          if grep -Eq '^  # aws_security_group\.database_access (will be destroyed|must be replaced)' /tmp/tfplan.txt; then
-            echo "::error::O plano tenta destruir ou substituir o Security Group compartilhado."
-            exit 1
+            echo "Node group nao sera criado ou substituido neste plano."
           fi
 
           echo "Plano aprovado para apply."
 
       - name: Terraform apply
         if: inputs.action == 'deploy'
-        timeout-minutes: 35
+        timeout-minutes: 40
         run: |
           set -euo pipefail
           terraform apply -auto-approve tfplan
 
-      - name: Extrair configuracao atual do cluster
+      - name: Descobrir e configurar cluster EKS atual
         if: inputs.action == 'deploy'
-        timeout-minutes: 2
-        run: |
-          set -euo pipefail
-
-          terraform show -json > /tmp/terraform-state.json
-
-          EKS_CLUSTER_NAME_CURRENT="$(
-            jq -r '
-              .values.root_module.resources[]
-              | select(.type == "aws_eks_cluster" and .name == "main")
-              | .values.name
-            ' /tmp/terraform-state.json
-          )"
-
-          EKS_CLUSTER_ENDPOINT_CURRENT="$(
-            jq -r '
-              .values.root_module.resources[]
-              | select(.type == "aws_eks_cluster" and .name == "main")
-              | .values.endpoint
-            ' /tmp/terraform-state.json
-          )"
-
-          EKS_CLUSTER_CA_CURRENT="$(
-            jq -r '
-              .values.root_module.resources[]
-              | select(.type == "aws_eks_cluster" and .name == "main")
-              | .values.certificate_authority[0].data
-            ' /tmp/terraform-state.json
-          )"
-
-          : "${EKS_CLUSTER_NAME_CURRENT:?Nome do cluster nao encontrado no state}"
-          : "${EKS_CLUSTER_ENDPOINT_CURRENT:?Endpoint do cluster nao encontrado no state}"
-          : "${EKS_CLUSTER_CA_CURRENT:?CA do cluster nao encontrado no state}"
-
-          echo "EKS_CLUSTER_NAME=$EKS_CLUSTER_NAME_CURRENT" >> "$GITHUB_ENV"
-          echo "EKS_CLUSTER_ENDPOINT=$EKS_CLUSTER_ENDPOINT_CURRENT" >> "$GITHUB_ENV"
-          echo "EKS_CLUSTER_CA=$EKS_CLUSTER_CA_CURRENT" >> "$GITHUB_ENV"
-
-          echo "Cluster atual: $EKS_CLUSTER_NAME_CURRENT"
-          echo "Endpoint atual obtido do state."
-
-      - name: Configurar cluster sem DescribeCluster
-        if: inputs.action == 'deploy'
-        timeout-minutes: 3
+        timeout-minutes: 18
         working-directory: .
+        env:
+          PROJECT_NAME: oficina360
+          ENVIRONMENT: lab
+          AWS_REGION: ${{ env.AWS_REGION }}
+          WAIT_SECONDS: "900"
         run: |
           set -euo pipefail
-          bash scripts/configure-eks-kubeconfig.sh
+          bash scripts/resolve-eks-runtime.sh
 
       - name: Validar cluster e node group
         if: inputs.action == 'deploy'
@@ -355,23 +295,26 @@ jobs:
 
           echo "Nodes Ready: $READY_NODES"
 
-      - name: Gerar resumo para atualizar Repository Variables
+      - name: Gerar resumo da infraestrutura atual
         if: inputs.action == 'deploy'
         working-directory: .
         run: |
-          {
-            echo "EKS_CLUSTER_NAME=$EKS_CLUSTER_NAME"
-            echo "EKS_CLUSTER_ENDPOINT=$EKS_CLUSTER_ENDPOINT"
-            echo "EKS_CLUSTER_CA_LENGTH=${#EKS_CLUSTER_CA}"
-            echo
-            echo "Atualize EKS_CLUSTER_ENDPOINT e EKS_CLUSTER_CA nas Repository Variables antes dos workflows da aplicacao, Kong e observabilidade."
-          } | tee cluster-runtime-summary.txt
+          set -euo pipefail
 
-      - name: Publicar resumo do cluster
+          {
+            echo "account_id=$(aws sts get-caller-identity --query Account --output text)"
+            echo "region=$AWS_REGION"
+            echo "cluster_name=$EKS_CLUSTER_NAME"
+            echo "vpc_id=$(terraform -chdir=terraform/lab output -raw vpc_id)"
+            echo "database_access_security_group_id=$(terraform -chdir=terraform/lab output -raw database_access_security_group_id)"
+            echo "subnet_ids=$(terraform -chdir=terraform/lab output -json subnet_ids | jq -c .)"
+          } | tee infrastructure-runtime-summary.txt
+
+      - name: Publicar resumo da infraestrutura
         if: inputs.action == 'deploy'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: cluster-runtime-summary
-          path: cluster-runtime-summary.txt
+          name: infrastructure-runtime-summary
+          path: infrastructure-runtime-summary.txt
           if-no-files-found: error
           retention-days: 1
