@@ -69,13 +69,13 @@ jobs:
           : "${EKS_CLUSTER_ROLE_ARN:?Repository Variable EKS_CLUSTER_ROLE_ARN nao definida}"
           : "${EKS_NODE_ROLE_ARN:?Repository Variable EKS_NODE_ROLE_ARN nao definida}"
 
-          if [[ ! "$EKS_CLUSTER_ROLE_ARN" =~ ^arn:aws:iam::[0-9]{12}:role/(.*/)?LabEksClusterRole.*$ ]]; then
-            echo "::error::EKS_CLUSTER_ROLE_ARN possui formato invalido."
+          if [[ ! "$EKS_CLUSTER_ROLE_ARN" =~ ^arn:aws:iam::[0-9]{12}:role/.+$ ]]; then
+            echo "::error::EKS_CLUSTER_ROLE_ARN nao e um ARN IAM Role valido."
             exit 1
           fi
 
-          if [[ ! "$EKS_NODE_ROLE_ARN" =~ ^arn:aws:iam::[0-9]{12}:role/(.*/)?LabEksNodeRole.*$ ]]; then
-            echo "::error::EKS_NODE_ROLE_ARN possui formato invalido."
+          if [[ ! "$EKS_NODE_ROLE_ARN" =~ ^arn:aws:iam::[0-9]{12}:role/.+$ ]]; then
+            echo "::error::EKS_NODE_ROLE_ARN nao e um ARN IAM Role valido."
             exit 1
           fi
 
