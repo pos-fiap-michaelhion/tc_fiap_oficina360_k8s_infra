@@ -276,11 +276,13 @@ jobs:
           : "${DB_USERNAME:?GitHub Secret DB_USERNAME nao definido}"
           : "${DB_PASSWORD:?GitHub Secret DB_PASSWORD nao definido}"
           : "${JWT_SECRET:?GitHub Secret JWT_SECRET nao definido}"
+          : "${JWT_ISSUER:?JWT_ISSUER nao definido}"
 
           echo "::add-mask::$DATABASE_URL"
           echo "::add-mask::$DB_USERNAME"
           echo "::add-mask::$DB_PASSWORD"
           echo "::add-mask::$JWT_SECRET"
+          echo "::add-mask::$JWT_ISSUER"
           echo "::add-mask::$IMAGE"
 
           if [[ ! "$DATABASE_URL" =~ ^jdbc:postgresql://([^/:]+):([0-9]+)/([^/?]+)$ ]]; then
@@ -303,6 +305,7 @@ jobs:
             --from-literal=DB_HOST="$DATABASE_HOST" \
             --from-literal=DB_PORT="$DATABASE_PORT" \
             --from-literal=DB_NAME="$DATABASE_NAME" \
+            --from-literal=JWT_ISSUER="$JWT_ISSUER" \
             --from-literal=SPRING_PROFILES_ACTIVE=docker \
             --from-literal=SERVER_PORT=8081 \
             --dry-run=client \
