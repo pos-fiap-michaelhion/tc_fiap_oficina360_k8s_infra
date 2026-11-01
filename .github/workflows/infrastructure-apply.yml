@@ -123,10 +123,8 @@ jobs:
         timeout-minutes: 2
         working-directory: .
         env:
-          EKS_CLUSTER_ROLE_ARN_CONFIGURED: ${{ vars.EKS_CLUSTER_ROLE_ARN }}
-          EKS_NODE_ROLE_ARN_CONFIGURED: ${{ vars.EKS_NODE_ROLE_ARN }}
-          EKS_CLUSTER_ROLE_NAME: ${{ vars.EKS_CLUSTER_ROLE_NAME || 'LabEksClusterRole' }}
-          EKS_NODE_ROLE_NAME: ${{ vars.EKS_NODE_ROLE_NAME || 'LabEksNodeRole' }}
+          EKS_CLUSTER_ROLE_ARN_CONFIGURED: ${{ secrets.EKS_CLUSTER_ROLE_ARN }}
+          EKS_NODE_ROLE_ARN_CONFIGURED: ${{ secrets.EKS_NODE_ROLE_ARN }}
         run: |
           set -euo pipefail
           bash scripts/resolve-lab-roles.sh

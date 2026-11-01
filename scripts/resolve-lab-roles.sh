@@ -1,66 +1,78 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+# Resolve os ARNs das roles do EKS no AWS Learner Lab.
+#
+# O Learner Lab bloqueia iam:ListRoles com deny explicito (policy
+# voc-cancel-cred), entao as roles NAO sao descobertas por listagem. O ARN e
+# montado a partir do account ID (sts:GetCallerIdentity, sempre permitido).
+#
+# Entradas (opcionais):
+#   EKS_CLUSTER_ROLE_ARN_CONFIGURED  ARN da role do cluster (secret)
+#   EKS_NODE_ROLE_ARN_CONFIGURED     ARN da role dos nodes (secret)
+#   LAB_CLUSTER_ROLE_NAME            nome padrao da role do cluster (LabRole)
+#   LAB_NODE_ROLE_NAME               nome padrao da role dos nodes (LabRole)
+#
+# Saidas (GITHUB_ENV):
+#   TF_VAR_eks_cluster_role_arn
+#   TF_VAR_eks_node_role_arn
+set -euo pipefail
 
-EKS_CLUSTER_ROLE_PATTERN="${EKS_CLUSTER_ROLE_PATTERN:-LabEksClusterRole}"
-EKS_NODE_ROLE_PATTERN="${EKS_NODE_ROLE_PATTERN:-LabEksNodeRole}"
+: "${GITHUB_ENV:=/dev/null}"
 
-fail(){ printf '[ERRO] %s\n' "$*" >&2; exit 1; }
-mask(){ [[ -n "${1:-}" ]] && echo "::add-mask::$1"; }
+CLUSTER_CONFIGURED="${EKS_CLUSTER_ROLE_ARN_CONFIGURED:-}"
+NODE_CONFIGURED="${EKS_NODE_ROLE_ARN_CONFIGURED:-}"
+CLUSTER_ROLE_NAME="${LAB_CLUSTER_ROLE_NAME:-LabRole}"
+NODE_ROLE_NAME="${LAB_NODE_ROLE_NAME:-LabRole}"
 
-for cmd in aws jq; do
-  command -v "$cmd" >/dev/null 2>&1 || fail "$cmd nao encontrado"
-done
-
-IDENTITY_JSON="$(aws sts get-caller-identity --output json)"
-ACCOUNT_ID="$(jq -r '.Account' <<< "$IDENTITY_JSON")"
-CALLER_ARN="$(jq -r '.Arn' <<< "$IDENTITY_JSON")"
-USER_ID="$(jq -r '.UserId' <<< "$IDENTITY_JSON")"
-
-# Mascare dados somente fora de command substitution.
-mask "$ACCOUNT_ID"
-mask "$CALLER_ARN"
-mask "$USER_ID"
-mask "${CALLER_ARN##*/}"
-
-if ! ROLES_JSON="$(aws iam list-roles --output json 2>/tmp/iam-list-roles-error.txt)"; then
-  cat /tmp/iam-list-roles-error.txt >&2
-  fail "Nao foi possivel descobrir as roles atuais"
+ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+if ! [[ "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
+  echo "::error::Nao foi possivel obter o account ID via sts:GetCallerIdentity."
+  exit 1
 fi
+echo "::add-mask::$ACCOUNT_ID"
 
-resolve_unique_role() {
-  local pattern="$1"
-  local kind="$2"
-  local count arn
+ARN_RE="^arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$"
 
-  count="$(jq --arg p "$pattern" '[.Roles[] | select(.RoleName | contains($p))] | length' <<< "$ROLES_JSON")"
-  [[ "$count" -eq 1 ]] || fail "Era esperada uma unica role para $kind; encontradas: $count"
+# resolve <rotulo> <arn configurado> <nome padrao>  -> imprime o ARN escolhido
+resolve() {
+  local label="$1" configured="$2" default_name="$3"
 
-  # Esta funcao deve escrever somente o ARN no stdout.
-  arn="$(jq -r --arg p "$pattern" '.Roles[] | select(.RoleName | contains($p)) | .Arn' <<< "$ROLES_JSON")"
-  printf '%s\n' "$arn"
+  if [[ -n "$configured" ]]; then
+    if ! [[ "$configured" =~ $ARN_RE ]]; then
+      echo "::warning::Secret da role $label nao e um ARN de role valido. Usando $default_name." >&2
+    elif [[ "$configured" != arn:aws:iam::"$ACCOUNT_ID":role/* ]]; then
+      echo "::warning::Secret da role $label aponta para outra conta (o lab foi recriado?). Usando $default_name da conta atual." >&2
+    else
+      printf '%s' "$configured"
+      return 0
+    fi
+  fi
+
+  printf 'arn:aws:iam::%s:role/%s' "$ACCOUNT_ID" "$default_name"
 }
 
-CLUSTER_ARN="$(resolve_unique_role "$EKS_CLUSTER_ROLE_PATTERN" "cluster EKS")"
-NODE_ARN="$(resolve_unique_role "$EKS_NODE_ROLE_PATTERN" "node group EKS")"
+CLUSTER_ROLE_ARN="$(resolve cluster "$CLUSTER_CONFIGURED" "$CLUSTER_ROLE_NAME")"
+NODE_ROLE_ARN="$(resolve node "$NODE_CONFIGURED" "$NODE_ROLE_NAME")"
 
-# Agora as mascaras nao contaminam os valores capturados.
-mask "$CLUSTER_ARN"
-mask "$NODE_ARN"
-mask "${CLUSTER_ARN##*/}"
-mask "${NODE_ARN##*/}"
+# Verificacao opcional. iam:GetRole costuma funcionar no Learner Lab, mas se
+# tambem estiver bloqueado nao e motivo para falhar: o EKS valida a role no apply.
+verify() {
+  local label="$1" arn="$2" name
+  name="${arn##*/}"
+  if aws iam get-role --role-name "$name" >/dev/null 2>&1; then
+    echo "Role $label verificada: $name"
+  else
+    echo "::warning::Nao foi possivel verificar a role $label ($name) via iam:GetRole. Seguindo com o ARN montado."
+  fi
+}
+verify cluster "$CLUSTER_ROLE_ARN"
+verify node "$NODE_ROLE_ARN"
 
-[[ "$CLUSTER_ARN" == "arn:aws:iam::${ACCOUNT_ID}:role/"* ]] || fail "Cluster role nao pertence a conta atual"
-[[ "$NODE_ARN" == "arn:aws:iam::${ACCOUNT_ID}:role/"* ]] || fail "Node role nao pertence a conta atual"
-[[ "$CLUSTER_ARN" != "$NODE_ARN" ]] || fail "Cluster role e node role nao podem ser iguais"
+echo "::add-mask::$CLUSTER_ROLE_ARN"
+echo "::add-mask::$NODE_ROLE_ARN"
 
-aws iam get-role --role-name "${CLUSTER_ARN##*/}" --query 'Role.Arn' --output text >/dev/null
-aws iam get-role --role-name "${NODE_ARN##*/}" --query 'Role.Arn' --output text >/dev/null
+{
+  echo "TF_VAR_eks_cluster_role_arn=$CLUSTER_ROLE_ARN"
+  echo "TF_VAR_eks_node_role_arn=$NODE_ROLE_ARN"
+} >> "$GITHUB_ENV"
 
-if [[ -n "${GITHUB_ENV:-}" ]]; then
-  {
-    echo "TF_VAR_eks_cluster_role_arn=$CLUSTER_ARN"
-    echo "TF_VAR_eks_node_role_arn=$NODE_ARN"
-  } >> "$GITHUB_ENV"
-fi
-
-echo "Roles EKS atuais descobertas e validadas com sucesso."
+echo "Roles EKS resolvidas: cluster=${CLUSTER_ROLE_ARN##*/} node=${NODE_ROLE_ARN##*/}"
