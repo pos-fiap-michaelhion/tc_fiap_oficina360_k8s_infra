@@ -7,7 +7,10 @@ on:
         description: Acao
         required: true
         type: choice
-        options: [validate, deploy, destroy]
+        options:
+          - validate
+          - deploy
+          - destroy
 
 permissions:
   contents: read
@@ -18,42 +21,131 @@ concurrency:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-  CLUSTER_NAME: oficina360
+  PROJECT_NAME: oficina360
+  ENVIRONMENT: lab
   NAMESPACE: observability
 
 jobs:
   observability:
+    name: Observabilidade ${{ inputs.action }}
     runs-on: ubuntu-latest
+    timeout-minutes: 35
+
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
-      - name: Helm repository
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+
+      - name: Configurar repositorio Helm
         run: |
-          helm repo add grafana https://grafana.github.io/helm-charts --force-update
-          helm repo update
-      - name: Validate
+          set -euo pipefail
+          helm repo add grafana https://grafana.github.io/helm-charts --force-update >/dev/null
+          helm repo update >/dev/null
+          echo "Repositorio Helm configurado."
+
+      - name: Validar charts e dashboard
         if: inputs.action == 'validate'
         run: |
+          set -euo pipefail
+
           for chart in loki alloy grafana; do
-            helm template "$chart" "grafana/$chart" --namespace "$NAMESPACE" \
-              -f "k8s/observabilidade/${chart}-values.yaml" > "/tmp/${chart}.yaml"
+            helm template "$chart" "grafana/$chart" \
+              --namespace "$NAMESPACE" \
+              -f "k8s/observabilidade/${chart}-values.yaml" \
+              > "/tmp/${chart}-rendered.yaml"
+
+            test -s "/tmp/${chart}-rendered.yaml"
           done
-          kubectl apply --dry-run=client --validate=false -f k8s/grafana/dashboard-oficina360.yaml
-      - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+
+          kubectl apply \
+            --dry-run=client \
+            --validate=false \
+            -f k8s/grafana/dashboard-oficina360.yaml \
+            >/dev/null
+
+          echo "Charts e dashboard validados."
+
+      - name: Configurar credenciais AWS
         if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Configurar acesso ao EKS
-        env:
-          EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+      - name: Validar identidade AWS sem expor dados
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
         run: |
           set -euo pipefail
 
-          : "${EKS_CLUSTER_NAME:?Repository Variable EKS_CLUSTER_NAME nao definida}"
+          IDENTITY_JSON="$(aws sts get-caller-identity --output json)"
+          ACCOUNT_ID="$(jq -r '.Account' <<< "$IDENTITY_JSON")"
+          CALLER_ARN="$(jq -r '.Arn' <<< "$IDENTITY_JSON")"
+          USER_ID="$(jq -r '.UserId' <<< "$IDENTITY_JSON")"
+
+          : "${ACCOUNT_ID:?Conta AWS nao identificada}"
+          : "${CALLER_ARN:?Caller ARN nao identificado}"
+          : "${USER_ID:?User ID nao identificado}"
+
+          echo "::add-mask::$ACCOUNT_ID"
+          echo "::add-mask::$CALLER_ARN"
+          echo "::add-mask::$USER_ID"
+          echo "::add-mask::${CALLER_ARN##*/}"
+
+          echo "Identidade AWS validada."
+
+      - name: Descobrir e configurar cluster EKS atual
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        run: |
+          set -euo pipefail
+
+          mapfile -t CLUSTERS < <(
+            aws eks list-clusters \
+              --region "$AWS_REGION" \
+              --query 'clusters[]' \
+              --output text |
+            tr '\t' '\n' |
+            sed '/^$/d'
+          )
+
+          [[ "${#CLUSTERS[@]}" -gt 0 ]] || {
+            echo "::error::Nenhum cluster EKS encontrado na regiao configurada."
+            exit 1
+          }
+
+          CANDIDATES=()
+
+          for cluster_name in "${CLUSTERS[@]}"; do
+            CLUSTER_JSON="$(
+              aws eks describe-cluster \
+                --name "$cluster_name" \
+                --region "$AWS_REGION" \
+                --output json
+            )"
+
+            CLUSTER_PROJECT="$(jq -r '.cluster.tags.Project // empty' <<< "$CLUSTER_JSON")"
+            CLUSTER_ENVIRONMENT="$(jq -r '.cluster.tags.Environment // empty' <<< "$CLUSTER_JSON")"
+
+            if [[ "$cluster_name" == "$PROJECT_NAME" ]] ||
+               [[ "$CLUSTER_PROJECT" == "$PROJECT_NAME" && "$CLUSTER_ENVIRONMENT" == "$ENVIRONMENT" ]]; then
+              CANDIDATES+=("$cluster_name")
+            fi
+          done
+
+          if [[ "${#CANDIDATES[@]}" -eq 0 && "${#CLUSTERS[@]}" -eq 1 ]]; then
+            CANDIDATES=("${CLUSTERS[0]}")
+          fi
+
+          [[ "${#CANDIDATES[@]}" -eq 1 ]] || {
+            echo "::error::Nao foi possivel selecionar um unico cluster EKS."
+            exit 1
+          }
+
+          EKS_CLUSTER_NAME="${CANDIDATES[0]}"
+          echo "::add-mask::$EKS_CLUSTER_NAME"
 
           CLUSTER_STATUS="$(
             aws eks describe-cluster \
@@ -63,57 +155,236 @@ jobs:
               --output text
           )"
 
-          if [[ "$CLUSTER_STATUS" != "ACTIVE" ]]; then
-            echo "::error::Cluster EKS nao esta ACTIVE. Status: $CLUSTER_STATUS"
+          [[ "$CLUSTER_STATUS" == "ACTIVE" ]] || {
+            echo "::error::O cluster EKS nao esta ACTIVE."
             exit 1
-          fi
+          }
 
-          export KUBECONFIG="$RUNNER_TEMP/oficina360-kubeconfig"
-          rm -f "$KUBECONFIG"
-          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
+          KUBECONFIG_PATH="$RUNNER_TEMP/oficina360-kubeconfig"
+          rm -f "$KUBECONFIG_PATH"
+
+          echo "KUBECONFIG=$KUBECONFIG_PATH" >> "$GITHUB_ENV"
+          echo "EKS_CLUSTER_NAME=$EKS_CLUSTER_NAME" >> "$GITHUB_ENV"
 
           aws eks update-kubeconfig \
             --name "$EKS_CLUSTER_NAME" \
             --region "$AWS_REGION" \
             --alias oficina360 \
-            --kubeconfig "$KUBECONFIG"
+            --kubeconfig "$KUBECONFIG_PATH" \
+            >/dev/null
 
-          kubectl config current-context
-          kubectl cluster-info
-          kubectl get nodes
-      - name: Deploy
+          kubectl auth can-i get namespaces >/dev/null
+          echo "Acesso ao cluster configurado."
+
+      - name: Verificar permissoes Kubernetes
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        run: |
+          set -euo pipefail
+
+          kubectl auth can-i get namespaces >/dev/null
+
+          if [[ "${{ inputs.action }}" == "deploy" ]]; then
+            kubectl auth can-i create namespaces >/dev/null
+            kubectl auth can-i create secrets --namespace "$NAMESPACE" >/dev/null
+            kubectl auth can-i create configmaps --namespace "$NAMESPACE" >/dev/null
+          fi
+
+          echo "Permissoes Kubernetes validadas."
+
+      - name: Deploy observabilidade
         if: inputs.action == 'deploy'
         env:
           GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
         run: |
           set -euo pipefail
-          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-          kubectl create secret generic grafana-admin -n "$NAMESPACE" \
+
+          : "${GRAFANA_ADMIN_PASSWORD:?GitHub Secret GRAFANA_ADMIN_PASSWORD nao definido}"
+          echo "::add-mask::$GRAFANA_ADMIN_PASSWORD"
+
+          kubectl create namespace "$NAMESPACE" \
+            --dry-run=client \
+            --output yaml |
+            kubectl apply -f - >/dev/null
+
+          kubectl create secret generic grafana-admin \
+            --namespace "$NAMESPACE" \
             --from-literal=admin-user=admin \
             --from-literal=admin-password="$GRAFANA_ADMIN_PASSWORD" \
-            --dry-run=client -o yaml | kubectl apply -f -
-          kubectl apply -f k8s/grafana/dashboard-oficina360.yaml
-          helm upgrade --install loki grafana/loki -n "$NAMESPACE" -f k8s/observabilidade/loki-values.yaml --wait --timeout 12m
-          helm upgrade --install alloy grafana/alloy -n "$NAMESPACE" -f k8s/observabilidade/alloy-values.yaml --wait --timeout 10m
-          helm upgrade --install grafana grafana/grafana -n "$NAMESPACE" -f k8s/observabilidade/grafana-values.yaml --wait --timeout 10m
-      - name: Destroy
+            --dry-run=client \
+            --output yaml |
+            kubectl apply -f - >/dev/null
+
+          kubectl apply \
+            -f k8s/grafana/dashboard-oficina360.yaml \
+            >/dev/null
+
+          helm upgrade --install loki grafana/loki \
+            --namespace "$NAMESPACE" \
+            -f k8s/observabilidade/loki-values.yaml \
+            --wait \
+            --timeout 12m \
+            --hide-notes
+
+          helm upgrade --install alloy grafana/alloy \
+            --namespace "$NAMESPACE" \
+            -f k8s/observabilidade/alloy-values.yaml \
+            --wait \
+            --timeout 10m \
+            --hide-notes
+
+          helm upgrade --install grafana grafana/grafana \
+            --namespace "$NAMESPACE" \
+            -f k8s/observabilidade/grafana-values.yaml \
+            --wait \
+            --timeout 10m \
+            --hide-notes
+
+          echo "Observabilidade implantada com sucesso."
+
+      - name: Verificar deploy de observabilidade
+        if: inputs.action == 'deploy'
+        run: |
+          set -euo pipefail
+
+          for release in loki alloy grafana; do
+            STATUS="$(
+              helm status "$release" \
+                --namespace "$NAMESPACE" \
+                --output json |
+              jq -r '.info.status // empty'
+            )"
+
+            [[ "$STATUS" == "deployed" ]] || {
+              echo "::error::Um release de observabilidade nao esta deployed."
+              exit 1
+            }
+          done
+
+          POD_COUNT="$(
+            kubectl get pods \
+              --namespace "$NAMESPACE" \
+              --no-headers |
+            wc -l |
+            tr -d ' '
+          )"
+
+          READY_POD_COUNT="$(
+            kubectl get pods \
+              --namespace "$NAMESPACE" \
+              --output json |
+            jq '[
+              .items[]
+              | select(
+                  any(
+                    .status.conditions[]?;
+                    .type == "Ready" and .status == "True"
+                  )
+                )
+            ] | length'
+          )"
+
+          [[ "$POD_COUNT" -gt 0 ]] || {
+            echo "::error::Nenhum pod de observabilidade encontrado."
+            exit 1
+          }
+
+          [[ "$READY_POD_COUNT" -gt 0 ]] || {
+            echo "::error::Nenhum pod de observabilidade esta Ready."
+            exit 1
+          }
+
+          echo "Deploy de observabilidade validado."
+          echo "Releases implantados: 3"
+          echo "Pods encontrados: $POD_COUNT"
+          echo "Pods Ready: $READY_POD_COUNT"
+
+      - name: Destroy observabilidade
         if: inputs.action == 'destroy'
         run: |
-          helm uninstall grafana -n "$NAMESPACE" || true
-          helm uninstall alloy -n "$NAMESPACE" || true
-          helm uninstall loki -n "$NAMESPACE" || true
-          kubectl delete namespace "$NAMESPACE" --ignore-not-found=true || true
-      - name: Diagnostics file
-        if: always() && inputs.action != 'validate'
+          set -euo pipefail
+
+          for release in grafana alloy loki; do
+            helm uninstall "$release" \
+              --namespace "$NAMESPACE" \
+              --wait \
+              >/dev/null 2>&1 || true
+          done
+
+          kubectl delete namespace "$NAMESPACE" \
+            --ignore-not-found=true \
+            --wait=true \
+            --timeout=5m \
+            >/dev/null
+
+          if kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
+            echo "::error::Namespace de observabilidade ainda existe."
+            exit 1
+          fi
+
+          echo "Observabilidade removida."
+
+      - name: Gerar diagnostico sanitizado
+        if: failure() && inputs.action != 'validate'
         run: |
+          set -euo pipefail
+
+          NAMESPACE_EXISTS="false"
+          DEPLOYED_RELEASES="0"
+          POD_COUNT="0"
+          READY_POD_COUNT="0"
+          FAILED_POD_COUNT="0"
+
+          if kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
+            NAMESPACE_EXISTS="true"
+          fi
+
+          for release in loki alloy grafana; do
+            if helm status "$release" \
+              --namespace "$NAMESPACE" \
+              >/dev/null 2>&1; then
+              DEPLOYED_RELEASES=$((DEPLOYED_RELEASES + 1))
+            fi
+          done
+
+          PODS_JSON="$(
+            kubectl get pods \
+              --namespace "$NAMESPACE" \
+              --output json 2>/dev/null ||
+            echo '{"items":[]}'
+          )"
+
+          POD_COUNT="$(jq '.items | length' <<< "$PODS_JSON")"
+          READY_POD_COUNT="$(
+            jq '[
+              .items[]
+              | select(
+                  any(
+                    .status.conditions[]?;
+                    .type == "Ready" and .status == "True"
+                  )
+                )
+            ] | length' <<< "$PODS_JSON"
+          )"
+          FAILED_POD_COUNT="$(
+            jq '[.items[] | select(.status.phase == "Failed")] | length' \
+              <<< "$PODS_JSON"
+          )"
+
           {
-            helm list -n "$NAMESPACE" || true
-            kubectl get all -n "$NAMESPACE" -o wide || true
-            kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp || true
-          } > observability-diagnostics.txt 2>&1
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: always() && inputs.action != 'validate'
+            echo "status=failure"
+            echo "action=${{ inputs.action }}"
+            echo "namespace_exists=$NAMESPACE_EXISTS"
+            echo "deployed_releases=$DEPLOYED_RELEASES"
+            echo "pod_count=$POD_COUNT"
+            echo "ready_pod_count=$READY_POD_COUNT"
+            echo "failed_pod_count=$FAILED_POD_COUNT"
+          } > observability-diagnostics.txt
+
+      - name: Publicar diagnostico sanitizado
+        if: failure() && inputs.action != 'validate'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: observability-diagnostics
           path: observability-diagnostics.txt
+          if-no-files-found: warn
           retention-days: 1
