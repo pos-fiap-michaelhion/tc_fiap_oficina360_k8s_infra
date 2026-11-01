@@ -94,7 +94,7 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Validar identidade AWS sem expor dados pessoais
+      - name: Validar identidade AWS
         if: inputs.action == 'deploy'
         timeout-minutes: 1
         working-directory: .

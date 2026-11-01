@@ -55,7 +55,40 @@ jobs:
         working-directory: .
         run: |
           set -euo pipefail
-          aws sts get-caller-identity
+
+          IDENTITY_JSON="$(
+            aws sts get-caller-identity \
+              --output json
+          )"
+
+          ACCOUNT_ID="$(
+            jq -r '.Account' <<< "$IDENTITY_JSON"
+          )"
+
+          CALLER_ARN="$(
+            jq -r '.Arn' <<< "$IDENTITY_JSON"
+          )"
+
+          USER_ID="$(
+            jq -r '.UserId' <<< "$IDENTITY_JSON"
+          )"
+
+          echo "::add-mask::$ACCOUNT_ID"
+          echo "::add-mask::$CALLER_ARN"
+          echo "::add-mask::$USER_ID"
+
+          SESSION_NAME="${CALLER_ARN##*/}"
+
+          if [[ -n "$SESSION_NAME" ]]; then
+            echo "::add-mask::$SESSION_NAME"
+          fi
+
+          if [[ "$SESSION_NAME" == *"="* ]]; then
+            SESSION_IDENTITY="${SESSION_NAME##*=}"
+            echo "::add-mask::$SESSION_IDENTITY"
+          fi
+
+          echo "Identidade AWS validada com sucesso."
 
       - name: Configurar roles EKS
         timeout-minutes: 1
@@ -97,8 +130,9 @@ jobs:
           echo "TF_STATE_BUCKET=$TF_STATE_BUCKET" >> "$GITHUB_ENV"
           echo "TF_STATE_KEY=$TF_STATE_KEY" >> "$GITHUB_ENV"
 
-          echo "Backend bucket: $TF_STATE_BUCKET"
-          echo "Backend key: $TF_STATE_KEY"
+          echo "::add-mask::$TF_STATE_BUCKET"
+          echo "::add-mask::$TF_STATE_KEY"
+          echo "Backend Terraform configurado."
 
       - name: Terraform init
         run: |
