@@ -1,0 +1,128 @@
+===== CONTEXTO =====
+AWS account: 337958928021
+AWS caller: arn:aws:sts::337958928021:assumed-role/voclabs/user5231828=michael.hion@outlook.com
+AWS region: us-east-1
+Namespace: oficina360
+Deployment: oficina360-api
+Kubernetes Secret: oficina360-secret
+RDS: oficina360-lab-postgres
+
+===== VALIDANDO RECURSOS =====
+[OK] Namespace e deployment encontrados
+[OK] RDS disponivel em oficina360-lab-postgres.cmiwy5g3bvax.us-east-1.rds.amazonaws.com:5432/oficina360
+
+===== VALIDANDO SEGREDO RDS =====
+::add-mask::oficina360
+::add-mask::z<?<5oBj4>:1xoT<MvCA2)nQse5Z
+Usuario resolvido: oficina360
+Senha resolvida: presente, 28 caracteres
+[OK] Segredo RDS lido com sucesso
+
+===== PRESERVANDO JWT_SECRET =====
+::add-mask::teste
+[OK] JWT_SECRET atual preservado
+
+===== PLANO =====
+1. Atualizar DB_USERNAME e DB_PASSWORD no Kubernetes Secret oficina360-secret
+2. Preservar JWT_SECRET atual
+3. Atualizar DB_USERNAME e DB_PASSWORD no GitHub, se habilitado
+4. Reiniciar o deployment oficina360-api
+5. Aguardar rollout e validar logs do Flyway
+
+===== ATUALIZANDO KUBERNETES SECRET =====
+secret/oficina360-secret configured
+[OK] Kubernetes Secret atualizado
+
+===== ATUALIZANDO GITHUB SECRETS =====
+[OK] DB_USERNAME e DB_PASSWORD atualizados em pos-fiap-michaelhion/tc_fiap_oficina360_k8s_infra
+
+===== REINICIANDO APLICACAO =====
+deployment.apps/oficina360-api restarted
+Waiting for deployment "oficina360-api" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "oficina360-api" rollout to finish: 1 old replicas are pending termination...
+Waiting for deployment "oficina360-api" rollout to finish: 1 old replicas are pending termination...
+deployment "oficina360-api" successfully rolled out
+[OK] Rollout concluido
+
+===== VALIDANDO PODS =====
+NAME                              READY   STATUS    RESTARTS   AGE   IP           NODE                           NOMINATED NODE   READINESS GATES
+oficina360-api-64fb6b7464-qzwxx   1/1     Running   0          42s   10.42.7.25   ip-10-42-10-202.ec2.internal   <none>           <none>
+[OK] Deployment possui 1 replica(s) pronta(s)
+
+===== LOGS DA APLICACAO =====
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v4.1.1)
+
+2026-11-01T04:31:21.860Z  INFO 1 --- [oficina360-api] [           main] c.t.oficina360.Oficina360Application     : Starting Oficina360Application v0.0.1-SNAPSHOT using Java 21.0.12.1 with PID 1 (/app/app.jar started by ? in /app)
+2026-11-01T04:31:21.866Z  INFO 1 --- [oficina360-api] [           main] c.t.oficina360.Oficina360Application     : The following 1 profile is active: "docker"
+2026-11-01T04:31:27.062Z  INFO 1 --- [oficina360-api] [           main] .s.d.r.c.RepositoryConfigurationDelegate : Bootstrapping Spring Data JPA repositories in DEFAULT mode.
+2026-11-01T04:31:27.382Z  INFO 1 --- [oficina360-api] [           main] .s.d.r.c.RepositoryConfigurationDelegate : Finished Spring Data repository scanning in 290 ms. Found 7 JPA repository interfaces.
+2026-11-01T04:31:31.694Z  INFO 1 --- [oficina360-api] [           main] o.s.boot.tomcat.TomcatWebServer          : Tomcat initialized with port 8081 (http)
+2026-11-01T04:31:31.786Z  INFO 1 --- [oficina360-api] [           main] o.apache.catalina.core.StandardService   : Starting service [Tomcat]
+2026-11-01T04:31:31.786Z  INFO 1 --- [oficina360-api] [           main] o.apache.catalina.core.StandardEngine    : Starting Servlet engine: [Apache Tomcat/11.0.25]
+2026-11-01T04:31:32.064Z  INFO 1 --- [oficina360-api] [           main] b.w.c.s.WebApplicationContextInitializer : Root WebApplicationContext: initialization completed in 9978 ms
+2026-11-01T04:31:34.591Z  INFO 1 --- [oficina360-api] [           main] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Starting...
+2026-11-01T04:31:36.095Z  INFO 1 --- [oficina360-api] [           main] com.zaxxer.hikari.pool.HikariPool        : HikariPool-1 - Added connection org.postgresql.jdbc.PgConnection@20a9fb01
+2026-11-01T04:31:36.145Z  INFO 1 --- [oficina360-api] [           main] com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Start completed.
+2026-11-01T04:31:36.279Z  INFO 1 --- [oficina360-api] [           main] org.flywaydb.core.FlywayExecutor         : Database: jdbc:postgresql://oficina360-lab-postgres.cmiwy5g3bvax.us-east-1.rds.amazonaws.com:5432/oficina360 (PostgreSQL 16.13)
+2026-11-01T04:31:36.674Z  INFO 1 --- [oficina360-api] [           main] o.f.c.i.s.JdbcTableSchemaHistory         : Schema history table "public"."flyway_schema_history" does not exist yet
+2026-11-01T04:31:36.692Z  INFO 1 --- [oficina360-api] [           main] o.f.core.internal.command.DbValidate     : Successfully validated 7 migrations (execution time 00:00.130s)
+2026-11-01T04:31:36.777Z  INFO 1 --- [oficina360-api] [           main] o.f.c.i.s.JdbcTableSchemaHistory         : Creating Schema History table "public"."flyway_schema_history" ...
+2026-11-01T04:31:36.998Z  INFO 1 --- [oficina360-api] [           main] o.f.core.internal.command.DbMigrate      : Current version of schema "public": << Empty Schema >>
+2026-11-01T04:31:37.088Z  INFO 1 --- [oficina360-api] [           main] o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "1 - CREATE TABLES"
+2026-11-01T04:31:37.292Z  INFO 1 --- [oficina360-api] [           main] o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "2 - insert usuario admin"
+2026-11-01T04:31:37.462Z  INFO 1 --- [oficina360-api] [           main] o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "3 - insert reference data"
+2026-11-01T04:31:37.573Z  INFO 1 --- [oficina360-api] [           main] o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "4 - ALTER TABLES"
+2026-11-01T04:31:37.669Z  INFO 1 --- [oficina360-api] [           main] o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "5 - MASSA ORDEM SERVICOS"
+2026-11-01T04:31:37.777Z  INFO 1 --- [oficina360-api] [           main] o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "6 - ALTER TABLES"
+2026-11-01T04:31:37.857Z  INFO 1 --- [oficina360-api] [           main] o.f.core.internal.command.DbMigrate      : Migrating schema "public" to version "7 - UPDATE TABLES"
+2026-11-01T04:31:37.953Z  INFO 1 --- [oficina360-api] [           main] o.f.core.internal.command.DbMigrate      : Successfully applied 7 migrations to schema "public", now at version v7 (execution time 00:00.314s)
+2026-11-01T04:31:38.765Z  INFO 1 --- [oficina360-api] [           main] org.hibernate.orm.jpa                    : HHH008540: Processing PersistenceUnitInfo [name: default]
+2026-11-01T04:31:38.988Z  INFO 1 --- [oficina360-api] [           main] org.hibernate.orm.core                   : HHH000001: Hibernate ORM core version 7.4.5.Final
+2026-11-01T04:31:40.763Z  INFO 1 --- [oficina360-api] [           main] o.s.o.j.p.SpringPersistenceUnitInfo      : No LoadTimeWeaver setup: ignoring JPA class transformer
+2026-11-01T04:31:40.974Z  WARN 1 --- [oficina360-api] [           main] org.hibernate.orm.deprecation            : HHH90000025: PostgreSQLDialect does not need to be specified explicitly using 'hibernate.dialect' (remove the property setting and it will be selected by default)
+2026-11-01T04:31:41.005Z  INFO 1 --- [oficina360-api] [           main] org.hibernate.orm.connections.pooling    : HHH10001005: Database info:
+	Database JDBC URL [jdbc:postgresql://oficina360-lab-postgres.cmiwy5g3bvax.us-east-1.rds.amazonaws.com:5432/oficina360]
+	Database driver: PostgreSQL JDBC Driver
+	Database dialect: PostgreSQLDialect
+	Database version: 16.13
+	Default catalog/schema: oficina360/public
+	Autocommit mode: undefined/unknown
+	Isolation level: READ_COMMITTED [default READ_COMMITTED]
+	JDBC fetch size: none
+	Pool: DataSourceConnectionProvider
+	Minimum pool size: undefined/unknown
+	Maximum pool size: undefined/unknown
+2026-11-01T04:31:46.008Z  INFO 1 --- [oficina360-api] [           main] org.hibernate.orm.core                   : HHH000489: No JTA platform available (set 'hibernate.transaction.jta.platform' to enable JTA platform integration)
+2026-11-01T04:31:46.181Z  INFO 1 --- [oficina360-api] [           main] j.LocalContainerEntityManagerFactoryBean : Initialized JPA EntityManagerFactory for persistence unit 'default'
+2026-11-01T04:31:46.585Z  INFO 1 --- [oficina360-api] [           main] o.s.d.j.r.query.QueryEnhancerFactories   : Hibernate is in classpath; If applicable, HQL parser will be used.
+2026-11-01T04:31:47.997Z  INFO 1 --- [oficina360-api] [           main] r$InitializeUserDetailsManagerConfigurer : Global AuthenticationManager configured with UserDetailsService bean with name userDetailsServiceImpl
+2026-11-01T04:31:56.105Z  INFO 1 --- [oficina360-api] [           main] o.s.b.a.e.web.EndpointLinksResolver      : Exposing 3 endpoints beneath base path '/actuator'
+2026-11-01T04:31:56.464Z  INFO 1 --- [oficina360-api] [           main] o.s.boot.tomcat.TomcatWebServer          : Tomcat started on port 8081 (http) with context path '/'
+2026-11-01T04:31:56.493Z  INFO 1 --- [oficina360-api] [           main] c.t.oficina360.Oficina360Application     : Started Oficina360Application in 37.013 seconds (process running for 39.563)
+2026-11-01T04:31:56.997Z  WARN 1 --- [oficina360-api] [           main] o.s.core.events.SpringDocAppInitializer  : SpringDoc /v3/api-docs endpoint is enabled by default. To disable it in production, set the property 'springdoc.api-docs.enabled=false'
+2026-11-01T04:31:56.997Z  WARN 1 --- [oficina360-api] [           main] o.s.core.events.SpringDocAppInitializer  : SpringDoc /swagger-ui.html endpoint is enabled by default. To disable it in production, set the property 'springdoc.swagger-ui.enabled=false'
+2026-11-01T04:31:57.074Z  INFO 1 --- [oficina360-api] [nio-8081-exec-1] o.a.c.c.C.[Tomcat].[localhost].[/]       : Initializing Spring DispatcherServlet 'dispatcherServlet'
+2026-11-01T04:31:57.075Z  INFO 1 --- [oficina360-api] [nio-8081-exec-1] o.s.web.servlet.DispatcherServlet        : Initializing Servlet 'dispatcherServlet'
+2026-11-01T04:31:57.080Z  INFO 1 --- [oficina360-api] [nio-8081-exec-1] o.s.web.servlet.DispatcherServlet        : Completed initialization in 4 ms
+[OK] Aplicacao iniciou e Flyway nao apresenta erro de conexao
+
+===== VALIDACAO FINAL =====
+NAME                             READY   UP-TO-DATE   AVAILABLE   AGE   CONTAINERS       IMAGES                          SELECTOR
+deployment.apps/oficina360-api   1/1     1            1           17m   oficina360-api   michaelhion/oficina360:latest   app=oficina360-api
+
+NAME                                  READY   STATUS    RESTARTS   AGE   IP           NODE                           NOMINATED NODE   READINESS GATES
+pod/oficina360-api-64fb6b7464-qzwxx   1/1     Running   0          47s   10.42.7.25   ip-10-42-10-202.ec2.internal   <none>           <none>
+
+NAME                     TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)    AGE   SELECTOR
+service/oficina360-api   ClusterIP   172.20.145.17   <none>        8080/TCP   17m   app=oficina360-api
+[OK] Sincronizacao concluida
+Relatorio: sincronizacao-rds-aplicacao.txt
+Proximo passo: testar novamente o endpoint da Lambda.

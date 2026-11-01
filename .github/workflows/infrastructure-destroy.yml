@@ -69,12 +69,12 @@ jobs:
           : "${EKS_CLUSTER_ROLE_ARN:?Repository Variable EKS_CLUSTER_ROLE_ARN nao definida}"
           : "${EKS_NODE_ROLE_ARN:?Repository Variable EKS_NODE_ROLE_ARN nao definida}"
 
-          if [[ ! "$EKS_CLUSTER_ROLE_ARN" =~ ^arn:aws:iam::[0-9]{12}:role/.+LabEksClusterRole.*$ ]]; then
+          if [[ ! "$EKS_CLUSTER_ROLE_ARN" =~ ^arn:aws:iam::[0-9]{12}:role/(.*/)?LabEksClusterRole.*$ ]]; then
             echo "::error::EKS_CLUSTER_ROLE_ARN possui formato invalido."
             exit 1
           fi
 
-          if [[ ! "$EKS_NODE_ROLE_ARN" =~ ^arn:aws:iam::[0-9]{12}:role/.+LabEksNodeRole.*$ ]]; then
+          if [[ ! "$EKS_NODE_ROLE_ARN" =~ ^arn:aws:iam::[0-9]{12}:role/(.*/)?LabEksNodeRole.*$ ]]; then
             echo "::error::EKS_NODE_ROLE_ARN possui formato invalido."
             exit 1
           fi
@@ -101,52 +101,66 @@ jobs:
           echo "Backend key: $TF_STATE_KEY"
 
       - name: Terraform init
-        timeout-minutes: 5
-        env:
-          AWS_MAX_ATTEMPTS: "2"
-          AWS_RETRY_MODE: standard
-          AWS_PAGER: ""
         run: |
           set -euo pipefail
 
-          terraform init -reconfigure \
+          terraform init \
+            -reconfigure \
             -backend-config="bucket=$TF_STATE_BUCKET" \
             -backend-config="key=$TF_STATE_KEY" \
             -backend-config="region=$AWS_REGION" \
             -backend-config="use_lockfile=true"
 
       - name: Verificar state antes do destroy
-        timeout-minutes: 2
         run: |
           set -euo pipefail
 
-          terraform state list > /tmp/terraform-state-resources.txt
+          CURRENT_WORKSPACE="$(terraform workspace show)"
+
+          if [[ "$CURRENT_WORKSPACE" != "default" ]]; then
+            echo "::error::Workspace inesperado: $CURRENT_WORKSPACE"
+            exit 1
+          fi
+
+          terraform state pull > /tmp/current-state.tfstate
+
+          if ! jq -e '.version and (.resources | type == "array")' \
+            /tmp/current-state.tfstate >/dev/null; then
+            echo "::error::O backend nao retornou um state Terraform valido."
+            exit 1
+          fi
+
+          mapfile -t STATE_RESOURCES < <(terraform state list)
+          RESOURCE_COUNT="${#STATE_RESOURCES[@]}"
+
+          printf '%s\n' "${STATE_RESOURCES[@]}" \
+            > /tmp/terraform-state-resources.txt
 
           echo "===== RECURSOS NO STATE ====="
           cat /tmp/terraform-state-resources.txt
+          echo
+          echo "Total: $RESOURCE_COUNT"
 
-          if [[ ! -s /tmp/terraform-state-resources.txt ]]; then
+          if (( RESOURCE_COUNT == 0 )); then
             echo "::error::O state Terraform esta vazio."
             echo "::error::Destroy interrompido para evitar operar com state incorreto."
             exit 1
           fi
 
-          grep -qx 'aws_eks_cluster.main' /tmp/terraform-state-resources.txt || {
-            echo "::error::O state nao contem aws_eks_cluster.main."
-            exit 1
-          }
+          REQUIRED_RESOURCES=(
+            "aws_eks_cluster.main"
+            "aws_eks_node_group.main"
+            "module.vpc.aws_vpc.this[0]"
+          )
 
-          grep -qx 'aws_eks_node_group.main' /tmp/terraform-state-resources.txt || {
-            echo "::error::O state nao contem aws_eks_node_group.main."
-            exit 1
-          }
+          for resource in "${REQUIRED_RESOURCES[@]}"; do
+            if ! grep -Fxq "$resource" /tmp/terraform-state-resources.txt; then
+              echo "::error::Recurso obrigatorio ausente no state: $resource"
+              exit 1
+            fi
+          done
 
-          grep -q '^module\.vpc\.' /tmp/terraform-state-resources.txt || {
-            echo "::error::O state nao contem recursos do modulo VPC."
-            exit 1
-          }
-
-          echo "State remoto validado."
+          echo "State validado com sucesso."
 
       - name: Terraform validate
         timeout-minutes: 2
@@ -170,29 +184,39 @@ jobs:
           echo "VPC encontrada: $VPC_ID"
 
       - name: Configurar acesso ao EKS
+        working-directory: .
         env:
-          EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+          EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME || 'oficina360' }}
         run: |
           set -euo pipefail
 
           : "${EKS_CLUSTER_NAME:?Repository Variable EKS_CLUSTER_NAME nao definida}"
 
-          CLUSTER_STATUS="$(
+          if ! CLUSTER_STATUS="$(
             aws eks describe-cluster \
               --name "$EKS_CLUSTER_NAME" \
               --region "$AWS_REGION" \
               --query 'cluster.status' \
-              --output text
-          )"
+              --output text \
+              2>/tmp/eks-describe-error.txt
+          )"; then
+            echo "::warning::Cluster EKS nao encontrado ou inacessivel."
+            cat /tmp/eks-describe-error.txt
+            echo "EKS_AVAILABLE=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
 
           if [[ "$CLUSTER_STATUS" != "ACTIVE" ]]; then
-            echo "::error::Cluster EKS nao esta ACTIVE. Status: $CLUSTER_STATUS"
-            exit 1
+            echo "::warning::Cluster EKS nao esta ACTIVE. Status: $CLUSTER_STATUS"
+            echo "EKS_AVAILABLE=false" >> "$GITHUB_ENV"
+            exit 0
           fi
 
           export KUBECONFIG="$RUNNER_TEMP/oficina360-kubeconfig"
           rm -f "$KUBECONFIG"
+
           echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
+          echo "EKS_AVAILABLE=true" >> "$GITHUB_ENV"
 
           aws eks update-kubeconfig \
             --name "$EKS_CLUSTER_NAME" \
@@ -203,7 +227,9 @@ jobs:
           kubectl config current-context
           kubectl cluster-info
           kubectl get nodes
+
       - name: Remover releases Helm
+        if: env.EKS_AVAILABLE == 'true'
         timeout-minutes: 15
         working-directory: .
         run: |
@@ -233,6 +259,7 @@ jobs:
           uninstall_release kong kong
 
       - name: Remover namespaces externos ao Terraform
+        if: env.EKS_AVAILABLE == 'true'
         timeout-minutes: 12
         working-directory: .
         run: |
@@ -283,19 +310,39 @@ jobs:
           echo "Aguardando remocao dos Load Balancers da VPC $VPC_ID..."
 
           for attempt in $(seq 1 60); do
-            CLASSIC_JSON="$(
+            if ! CLASSIC_JSON="$(
               aws elb describe-load-balancers \
                 --region "$AWS_REGION" \
-                --output json 2>/tmp/classic-lb-error.txt ||
-              printf '{"LoadBalancerDescriptions":[]}'
-            )"
+                --output json \
+                2>/tmp/classic-lb-error.txt
+            )"; then
+              echo "::error::Falha ao consultar Classic Load Balancers."
+              cat /tmp/classic-lb-error.txt
+              exit 1
+            fi
 
-            V2_JSON="$(
+            if ! V2_JSON="$(
               aws elbv2 describe-load-balancers \
                 --region "$AWS_REGION" \
-                --output json 2>/tmp/v2-lb-error.txt ||
-              printf '{"LoadBalancers":[]}'
-            )"
+                --output json \
+                2>/tmp/v2-lb-error.txt
+            )"; then
+              echo "::error::Falha ao consultar ALB/NLB."
+              cat /tmp/v2-lb-error.txt
+              exit 1
+            fi
+
+            if ! jq -e '.LoadBalancerDescriptions | type == "array"' \
+              <<< "$CLASSIC_JSON" >/dev/null; then
+              echo "::error::Resposta invalida da API ELB Classic."
+              exit 1
+            fi
+
+            if ! jq -e '.LoadBalancers | type == "array"' \
+              <<< "$V2_JSON" >/dev/null; then
+              echo "::error::Resposta invalida da API ELBv2."
+              exit 1
+            fi
 
             CLASSIC_COUNT="$(
               jq --arg vpc_id "$VPC_ID" \
@@ -347,11 +394,19 @@ jobs:
 
           cat /tmp/terraform-destroy-plan.txt
 
-          if ! grep -Eq '(aws_eks_cluster\.main.*will be destroyed|# aws_eks_cluster\.main will be destroyed)' \
-            /tmp/terraform-destroy-plan.txt; then
-            echo "::error::O plano nao inclui a destruicao de aws_eks_cluster.main."
-            exit 1
-          fi
+          REQUIRED_DESTROY_RESOURCES=(
+            "aws_eks_cluster.main"
+            "aws_eks_node_group.main"
+            "module.vpc.aws_vpc.this[0]"
+          )
+
+          for resource in "${REQUIRED_DESTROY_RESOURCES[@]}"; do
+            if ! grep -Fq "# $resource will be destroyed" \
+              /tmp/terraform-destroy-plan.txt; then
+              echo "::error::O plano nao inclui a destruicao de $resource."
+              exit 1
+            fi
+          done
 
           echo "Plano de destroy validado."
 
@@ -391,6 +446,7 @@ jobs:
             echo "commit=${GITHUB_SHA}"
             echo "region=${AWS_REGION}"
             echo "vpc_id=${VPC_ID:-nao-obtido}"
+            echo "eks_available=${EKS_AVAILABLE:-nao-avaliado}"
 
             echo
             echo "===== STATE ANTES ====="
@@ -403,6 +459,10 @@ jobs:
             echo
             echo "===== STATE DEPOIS ====="
             cat /tmp/terraform-state-after-destroy.txt 2>/dev/null || true
+
+            echo
+            echo "===== ERRO EKS ====="
+            cat /tmp/eks-describe-error.txt 2>/dev/null || true
 
             echo
             echo "===== ERRO CLASSIC LB ====="
