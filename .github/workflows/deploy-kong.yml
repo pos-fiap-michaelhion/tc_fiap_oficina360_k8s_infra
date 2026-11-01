@@ -25,6 +25,10 @@ env:
   ENVIRONMENT: lab
   KONG_NAMESPACE: kong
   KONG_RELEASE: kong
+  APP_NAMESPACE: oficina360
+  # Pode receber somente o host ou uma URL completa. O workflow normaliza o valor.
+  AUTH_API_HOST: ${{ vars.AUTH_API_HOST }}
+  AUTH_API_URL: ${{ vars.AUTH_API_URL }}
 
 jobs:
   kong:
@@ -46,7 +50,60 @@ jobs:
           helm repo update >/dev/null
           echo "Repositorio Helm configurado."
 
-      - name: Validar chart e Ingress
+      - name: Preparar manifestos Kubernetes
+        if: inputs.action == 'validate' || inputs.action == 'deploy'
+        run: |
+          set -euo pipefail
+
+          MANIFEST_SOURCE="k8s/kong/api-ingress.yaml"
+          MANIFEST_RENDERED="$RUNNER_TEMP/api-ingress-rendered.yaml"
+
+          test -s "$MANIFEST_SOURCE" || {
+            echo "::error::Manifesto $MANIFEST_SOURCE nao encontrado ou vazio."
+            exit 1
+          }
+
+          AUTH_ENDPOINT="${AUTH_API_HOST:-${AUTH_API_URL:-}}"
+
+          if grep -q '\${AUTH_API_HOST}' "$MANIFEST_SOURCE"; then
+            [[ -n "$AUTH_ENDPOINT" ]] || {
+              echo "::error::Defina a variable de organizacao AUTH_API_HOST ou AUTH_API_URL."
+              exit 1
+            }
+
+            # ExternalName aceita somente hostname: sem esquema, porta, caminho ou barra final.
+            AUTH_API_HOST="$(
+              printf '%s' "$AUTH_ENDPOINT" |
+                sed -E 's#^[[:space:]]+##; s#[[:space:]]+$##; s#^https?://##; s#/.*$##; s/:[0-9]+$//' |
+                tr '[:upper:]' '[:lower:]'
+            )"
+
+            [[ "$AUTH_API_HOST" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || {
+              echo "::error::AUTH_API_HOST nao resulta em um hostname DNS valido."
+              exit 1
+            }
+
+            [[ "$AUTH_API_HOST" != *..* ]] || {
+              echo "::error::AUTH_API_HOST contem pontos consecutivos."
+              exit 1
+            }
+
+            export AUTH_API_HOST
+            envsubst '${AUTH_API_HOST}' < "$MANIFEST_SOURCE" > "$MANIFEST_RENDERED"
+          else
+            cp "$MANIFEST_SOURCE" "$MANIFEST_RENDERED"
+          fi
+
+          if grep -nE '\$\{[A-Za-z_][A-Za-z0-9_]*\}' "$MANIFEST_RENDERED"; then
+            echo "::error::O manifesto ainda contem variaveis nao substituidas."
+            exit 1
+          fi
+
+          test -s "$MANIFEST_RENDERED"
+          echo "KONG_MANIFEST_RENDERED=$MANIFEST_RENDERED" >> "$GITHUB_ENV"
+          echo "Manifesto Kubernetes preparado."
+
+      - name: Validar chart e manifestos
         if: inputs.action == 'validate'
         run: |
           set -euo pipefail
@@ -54,12 +111,19 @@ jobs:
           helm template "$KONG_RELEASE" kong/kong \
             --namespace "$KONG_NAMESPACE" \
             -f k8s/kong/values.yaml \
-            > /tmp/kong-rendered.yaml
+            > "$RUNNER_TEMP/kong-rendered.yaml"
 
-          test -s /tmp/kong-rendered.yaml
-          test -s k8s/kong/api-ingress.yaml
+          test -s "$RUNNER_TEMP/kong-rendered.yaml"
+          test -s "$KONG_MANIFEST_RENDERED"
 
-          echo "Chart e Ingress validados."
+          # Validacao local de sintaxe e estrutura. Nao depende do cluster.
+          kubectl apply \
+            --dry-run=client \
+            --validate=false \
+            -f "$KONG_MANIFEST_RENDERED" \
+            >/dev/null
+
+          echo "Chart e manifestos validados."
 
       - name: Configurar credenciais AWS
         if: inputs.action == 'deploy' || inputs.action == 'destroy'
@@ -88,7 +152,6 @@ jobs:
           echo "::add-mask::$CALLER_ARN"
           echo "::add-mask::$USER_ID"
           echo "::add-mask::${CALLER_ARN##*/}"
-
           echo "Identidade AWS validada."
 
       - name: Descobrir e configurar cluster EKS atual
@@ -111,7 +174,6 @@ jobs:
           }
 
           CANDIDATES=()
-
           for cluster_name in "${CLUSTERS[@]}"; do
             CLUSTER_JSON="$(
               aws eks describe-cluster \
@@ -156,9 +218,6 @@ jobs:
 
           KUBECONFIG_PATH="$RUNNER_TEMP/oficina360-kubeconfig"
           rm -f "$KUBECONFIG_PATH"
-
-          # GITHUB_ENV so fica disponivel nos proximos steps. O export garante
-          # que o kubectl deste mesmo step use o kubeconfig recem-criado.
           export KUBECONFIG="$KUBECONFIG_PATH"
 
           echo "KUBECONFIG=$KUBECONFIG_PATH" >> "$GITHUB_ENV"
@@ -182,10 +241,10 @@ jobs:
             exit 1
           }
 
-          if ! kubectl --request-timeout=20s auth can-i get namespaces >/dev/null; then
+          kubectl --request-timeout=20s auth can-i get namespaces >/dev/null || {
             echo "::error::Nao foi possivel autenticar no cluster EKS."
             exit 1
-          fi
+          }
 
           echo "Acesso ao cluster configurado."
 
@@ -200,6 +259,8 @@ jobs:
             kubectl auth can-i create namespaces >/dev/null
             kubectl auth can-i create deployments --namespace "$KONG_NAMESPACE" >/dev/null
             kubectl auth can-i create services --namespace "$KONG_NAMESPACE" >/dev/null
+            kubectl auth can-i create services --namespace "$APP_NAMESPACE" >/dev/null
+            kubectl auth can-i create ingresses.networking.k8s.io --namespace "$APP_NAMESPACE" >/dev/null
           fi
 
           echo "Permissoes Kubernetes validadas."
@@ -214,6 +275,11 @@ jobs:
             --output yaml |
             kubectl apply -f - >/dev/null
 
+          kubectl create namespace "$APP_NAMESPACE" \
+            --dry-run=client \
+            --output yaml |
+            kubectl apply -f - >/dev/null
+
           helm upgrade --install "$KONG_RELEASE" kong/kong \
             --namespace "$KONG_NAMESPACE" \
             -f k8s/kong/values.yaml \
@@ -221,14 +287,16 @@ jobs:
             --timeout 10m \
             --hide-notes
 
-          kubectl apply -f k8s/kong/api-ingress.yaml >/dev/null
-
           kubectl rollout status \
             deployment/kong-kong \
             --namespace "$KONG_NAMESPACE" \
             --timeout=5m
 
-          echo "Kong implantado com sucesso."
+          # Aplica somente o manifesto renderizado. Nunca envia ${AUTH_API_HOST}
+          # literalmente ao Kubernetes.
+          kubectl apply -f "$KONG_MANIFEST_RENDERED"
+
+          echo "Kong e rotas implantados com sucesso."
 
       - name: Verificar deploy Kong
         if: inputs.action == 'deploy'
@@ -238,15 +306,13 @@ jobs:
           READY_REPLICAS="$(
             kubectl get deployment kong-kong \
               --namespace "$KONG_NAMESPACE" \
-              --output jsonpath='{.status.readyReplicas}' 2>/dev/null ||
-            echo 0
+              --output jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0
           )"
 
           AVAILABLE_REPLICAS="$(
             kubectl get deployment kong-kong \
               --namespace "$KONG_NAMESPACE" \
-              --output jsonpath='{.status.availableReplicas}' 2>/dev/null ||
-            echo 0
+              --output jsonpath='{.status.availableReplicas}' 2>/dev/null || echo 0
           )"
 
           [[ "${READY_REPLICAS:-0}" -ge 1 ]] || {
@@ -259,17 +325,35 @@ jobs:
             exit 1
           }
 
-          kubectl get ingress \
-            --namespace oficina360 \
-            --no-headers \
+          kubectl get ingress oficina360-api \
+            --namespace "$APP_NAMESPACE" \
             >/dev/null 2>&1 || {
-              echo "::error::Ingress da aplicacao nao encontrado."
+              echo "::error::Ingress oficina360-api nao encontrado."
               exit 1
             }
+
+          EXTERNAL_NAME="$(
+            kubectl get service oficina360-auth-lambda \
+              --namespace "$APP_NAMESPACE" \
+              --output jsonpath='{.spec.externalName}' 2>/dev/null || true
+          )"
+
+          if grep -q '\${AUTH_API_HOST}' <<< "$EXTERNAL_NAME"; then
+            echo "::error::O Service da Lambda ainda contem AUTH_API_HOST sem substituicao."
+            exit 1
+          fi
+
+          INGRESS_HOST="$(
+            kubectl get ingress oficina360-api \
+              --namespace "$APP_NAMESPACE" \
+              --output jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true
+          )"
 
           echo "Deploy Kong validado."
           echo "Replicas prontas: $READY_REPLICAS"
           echo "Replicas disponiveis: $AVAILABLE_REPLICAS"
+          [[ -n "$EXTERNAL_NAME" ]] && echo "ExternalName da autenticacao validado."
+          [[ -n "$INGRESS_HOST" ]] && echo "Load balancer do Ingress disponivel."
 
       - name: Destroy Kong
         if: inputs.action == 'destroy'
@@ -310,63 +394,35 @@ jobs:
           AVAILABLE_REPLICAS="0"
           POD_COUNT="0"
           FAILED_POD_COUNT="0"
+          INGRESS_EXISTS="false"
+          AUTH_SERVICE_EXISTS="false"
 
-          if kubectl get namespace "$KONG_NAMESPACE" >/dev/null 2>&1; then
-            NAMESPACE_EXISTS="true"
-          fi
+          kubectl get namespace "$KONG_NAMESPACE" >/dev/null 2>&1 && NAMESPACE_EXISTS="true" || true
+          helm status "$KONG_RELEASE" --namespace "$KONG_NAMESPACE" >/dev/null 2>&1 && RELEASE_EXISTS="true" || true
+          kubectl get ingress oficina360-api --namespace "$APP_NAMESPACE" >/dev/null 2>&1 && INGRESS_EXISTS="true" || true
+          kubectl get service oficina360-auth-lambda --namespace "$APP_NAMESPACE" >/dev/null 2>&1 && AUTH_SERVICE_EXISTS="true" || true
 
-          if helm status "$KONG_RELEASE" \
-            --namespace "$KONG_NAMESPACE" \
-            >/dev/null 2>&1; then
-            RELEASE_EXISTS="true"
-          fi
-
-          if kubectl get deployment kong-kong \
-            --namespace "$KONG_NAMESPACE" \
-            >/dev/null 2>&1; then
-
+          if kubectl get deployment kong-kong --namespace "$KONG_NAMESPACE" >/dev/null 2>&1; then
             DEPLOYMENT_EXISTS="true"
-            READY_REPLICAS="$(
-              kubectl get deployment kong-kong \
-                --namespace "$KONG_NAMESPACE" \
-                --output jsonpath='{.status.readyReplicas}' 2>/dev/null ||
-              echo 0
-            )"
-            AVAILABLE_REPLICAS="$(
-              kubectl get deployment kong-kong \
-                --namespace "$KONG_NAMESPACE" \
-                --output jsonpath='{.status.availableReplicas}' 2>/dev/null ||
-              echo 0
-            )"
+            READY_REPLICAS="$(kubectl get deployment kong-kong --namespace "$KONG_NAMESPACE" --output jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)"
+            AVAILABLE_REPLICAS="$(kubectl get deployment kong-kong --namespace "$KONG_NAMESPACE" --output jsonpath='{.status.availableReplicas}' 2>/dev/null || echo 0)"
           fi
 
-          POD_COUNT="$(
-            kubectl get pods \
-              --namespace "$KONG_NAMESPACE" \
-              --no-headers 2>/dev/null |
-            wc -l |
-            tr -d ' '
-          )"
-
-          FAILED_POD_COUNT="$(
-            kubectl get pods \
-              --namespace "$KONG_NAMESPACE" \
-              --field-selector=status.phase=Failed \
-              --no-headers 2>/dev/null |
-            wc -l |
-            tr -d ' '
-          )"
+          POD_COUNT="$(kubectl get pods --namespace "$KONG_NAMESPACE" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+          FAILED_POD_COUNT="$(kubectl get pods --namespace "$KONG_NAMESPACE" --field-selector=status.phase=Failed --no-headers 2>/dev/null | wc -l | tr -d ' ')"
 
           {
             echo "status=failure"
             echo "action=${{ inputs.action }}"
-            echo "namespace_exists=$NAMESPACE_EXISTS"
+            echo "kong_namespace_exists=$NAMESPACE_EXISTS"
             echo "release_exists=$RELEASE_EXISTS"
             echo "deployment_exists=$DEPLOYMENT_EXISTS"
             echo "ready_replicas=${READY_REPLICAS:-0}"
             echo "available_replicas=${AVAILABLE_REPLICAS:-0}"
             echo "pod_count=${POD_COUNT:-0}"
             echo "failed_pod_count=${FAILED_POD_COUNT:-0}"
+            echo "ingress_exists=$INGRESS_EXISTS"
+            echo "auth_service_exists=$AUTH_SERVICE_EXISTS"
           } > kong-diagnostics.txt
 
       - name: Publicar diagnostico sanitizado
