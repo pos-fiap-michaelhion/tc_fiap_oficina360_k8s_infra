@@ -94,13 +94,29 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Validar identidade AWS
+      - name: Validar identidade AWS sem expor dados pessoais
         if: inputs.action == 'deploy'
         timeout-minutes: 1
         working-directory: .
         run: |
           set -euo pipefail
-          aws sts get-caller-identity
+
+          IDENTITY_JSON="$(aws sts get-caller-identity --output json)"
+          ACCOUNT_ID="$(jq -r '.Account' <<< "$IDENTITY_JSON")"
+          CALLER_ARN="$(jq -r '.Arn' <<< "$IDENTITY_JSON")"
+          USER_ID="$(jq -r '.UserId' <<< "$IDENTITY_JSON")"
+
+          echo "::add-mask::$ACCOUNT_ID"
+          echo "::add-mask::$CALLER_ARN"
+          echo "::add-mask::$USER_ID"
+
+          if [[ "$CALLER_ARN" == *"="* ]]; then
+            SESSION_NAME="${CALLER_ARN##*=}"
+            echo "::add-mask::$SESSION_NAME"
+          fi
+
+          echo "AWS_IDENTITY_VALIDATED=true" >> "$GITHUB_ENV"
+          echo "Identidade AWS validada com sucesso."
 
       - name: Resolver roles EKS da conta atual
         if: inputs.action == 'deploy'
@@ -115,9 +131,9 @@ jobs:
           set -euo pipefail
           bash scripts/resolve-lab-roles.sh
 
-      - name: Configurar backend Terraform
+      - name: Criar ou validar backend Terraform
         if: inputs.action == 'deploy'
-        timeout-minutes: 2
+        timeout-minutes: 4
         working-directory: .
         env:
           TF_STATE_BUCKET_CONFIGURED: ${{ vars.TF_STATE_BUCKET }}
@@ -126,24 +142,54 @@ jobs:
           set -euo pipefail
 
           ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-          TF_STATE_BUCKET="${TF_STATE_BUCKET_CONFIGURED:-oficina360-tfstate-${ACCOUNT_ID}-${AWS_REGION}}"
+          DEFAULT_BUCKET="oficina360-tfstate-${ACCOUNT_ID}-${AWS_REGION}"
+
+          if [[ -n "$TF_STATE_BUCKET_CONFIGURED" ]] &&
+             [[ "$TF_STATE_BUCKET_CONFIGURED" == *"${ACCOUNT_ID}"* ]]; then
+            TF_STATE_BUCKET="$TF_STATE_BUCKET_CONFIGURED"
+          else
+            TF_STATE_BUCKET="$DEFAULT_BUCKET"
+          fi
+
           TF_STATE_KEY="${TF_STATE_KEY_CONFIGURED:-oficina360/lab.tfstate}"
 
-          : "${TF_STATE_BUCKET:?Nao foi possivel resolver TF_STATE_BUCKET}"
-          : "${TF_STATE_KEY:?Nao foi possivel resolver TF_STATE_KEY}"
+          echo "::add-mask::$ACCOUNT_ID"
+          echo "::add-mask::$TF_STATE_BUCKET"
 
-          if ! aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/tmp/backend-error.txt; then
-            echo "::error::Bucket de state indisponivel: $TF_STATE_BUCKET"
-            cat /tmp/backend-error.txt
-            echo "::error::O backend deve existir antes do terraform init."
-            exit 1
+          if ! aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
+            echo "Backend ausente na conta atual. Criando bucket de state..."
+
+            if [[ "$AWS_REGION" == "us-east-1" ]]; then
+              aws s3api create-bucket \
+                --bucket "$TF_STATE_BUCKET" \
+                --region "$AWS_REGION" >/dev/null
+            else
+              aws s3api create-bucket \
+                --bucket "$TF_STATE_BUCKET" \
+                --region "$AWS_REGION" \
+                --create-bucket-configuration "LocationConstraint=$AWS_REGION" >/dev/null
+            fi
           fi
+
+          aws s3api put-bucket-encryption \
+            --bucket "$TF_STATE_BUCKET" \
+            --server-side-encryption-configuration \
+              '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+          aws s3api put-bucket-versioning \
+            --bucket "$TF_STATE_BUCKET" \
+            --versioning-configuration Status=Enabled
+
+          aws s3api put-public-access-block \
+            --bucket "$TF_STATE_BUCKET" \
+            --public-access-block-configuration \
+              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+          aws s3api head-bucket --bucket "$TF_STATE_BUCKET"
 
           echo "TF_STATE_BUCKET=$TF_STATE_BUCKET" >> "$GITHUB_ENV"
           echo "TF_STATE_KEY=$TF_STATE_KEY" >> "$GITHUB_ENV"
-
-          echo "Backend bucket: $TF_STATE_BUCKET"
-          echo "Backend key: $TF_STATE_KEY"
+          echo "Backend Terraform pronto."
 
       - name: Terraform init with remote backend
         if: inputs.action == 'deploy'
@@ -302,12 +348,11 @@ jobs:
           set -euo pipefail
 
           {
-            echo "account_id=$(aws sts get-caller-identity --query Account --output text)"
+            echo "status=success"
             echo "region=$AWS_REGION"
-            echo "cluster_name=$EKS_CLUSTER_NAME"
-            echo "vpc_id=$(terraform -chdir=terraform/lab output -raw vpc_id)"
-            echo "database_access_security_group_id=$(terraform -chdir=terraform/lab output -raw database_access_security_group_id)"
-            echo "subnet_ids=$(terraform -chdir=terraform/lab output -json subnet_ids | jq -c .)"
+            echo "project=oficina360"
+            echo "cluster_discovered=true"
+            echo "nodes_ready=$(kubectl get nodes --no-headers | awk '$2 == "Ready" {count++} END {print count+0}')"
           } | tee infrastructure-runtime-summary.txt
 
       - name: Publicar resumo da infraestrutura
