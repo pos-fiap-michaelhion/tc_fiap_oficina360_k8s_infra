@@ -1,7 +1,12 @@
 # Oficina360 - Infraestrutura AWS
 
 Infraestrutura como código da Oficina360 para o laboratório da Fase 3.
+---
+# Tecnologias utilizadas
+- Kubernets
+- Terraform
 
+---
 ## Arquitetura
 
 ```text
