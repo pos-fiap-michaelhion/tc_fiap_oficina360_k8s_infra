@@ -266,6 +266,7 @@ jobs:
           DB_USERNAME: ${{ secrets.DB_USERNAME }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          JWT_ISSUER: ${{ vars.JWT_ISSUER || 'oficina360-auth' }}
         run: |
           set -euo pipefail
 
