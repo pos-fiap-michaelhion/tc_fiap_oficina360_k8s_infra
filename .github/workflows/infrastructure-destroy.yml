@@ -147,20 +147,22 @@ jobs:
             exit 1
           fi
 
-          REQUIRED_RESOURCES=(
-            "aws_eks_cluster.main"
-            "aws_eks_node_group.main"
-            "module.vpc.aws_vpc.this[0]"
-          )
+          if ! grep -Fxq "module.vpc.aws_vpc.this[0]" \
+            /tmp/terraform-state-resources.txt; then
+            echo "::error::A VPC esperada nao esta presente no state."
+            echo "::error::Destroy interrompido para evitar usar um state incorreto."
+            exit 1
+          fi
 
-          for resource in "${REQUIRED_RESOURCES[@]}"; do
-            if ! grep -Fxq "$resource" /tmp/terraform-state-resources.txt; then
-              echo "::error::Recurso obrigatorio ausente no state: $resource"
-              exit 1
-            fi
-          done
+          if grep -Fxq "aws_eks_cluster.main" \
+            /tmp/terraform-state-resources.txt; then
+            echo "EKS ainda presente no state; destroy completo sera executado."
+          else
+            echo "::notice::EKS ja foi removido em uma tentativa anterior."
+            echo "::notice::O workflow continuara a partir dos recursos restantes."
+          fi
 
-          echo "State validado com sucesso."
+          echo "State valido para destroy inicial ou retomada."
 
       - name: Terraform validate
         timeout-minutes: 2
@@ -394,21 +396,20 @@ jobs:
 
           cat /tmp/terraform-destroy-plan.txt
 
-          REQUIRED_DESTROY_RESOURCES=(
-            "aws_eks_cluster.main"
-            "aws_eks_node_group.main"
-            "module.vpc.aws_vpc.this[0]"
-          )
+          if ! grep -Fq "# module.vpc.aws_vpc.this[0] will be destroyed" \
+            /tmp/terraform-destroy-plan.txt; then
+            echo "::error::O plano nao inclui a destruicao da VPC remanescente."
+            exit 1
+          fi
 
-          for resource in "${REQUIRED_DESTROY_RESOURCES[@]}"; do
-            if ! grep -Fq "# $resource will be destroyed" \
-              /tmp/terraform-destroy-plan.txt; then
-              echo "::error::O plano nao inclui a destruicao de $resource."
-              exit 1
-            fi
-          done
+          if grep -Fq "# aws_eks_cluster.main will be destroyed" \
+            /tmp/terraform-destroy-plan.txt; then
+            echo "Plano inclui o cluster EKS."
+          else
+            echo "::notice::Cluster EKS ausente do plano porque ja foi removido."
+          fi
 
-          echo "Plano de destroy validado."
+          echo "Plano de destroy validado para execucao inicial ou retomada."
 
       - name: Aplicar destroy
         timeout-minutes: 35
