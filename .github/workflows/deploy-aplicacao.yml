@@ -213,6 +213,10 @@ jobs:
           KUBECONFIG_PATH="$RUNNER_TEMP/oficina360-kubeconfig"
           rm -f "$KUBECONFIG_PATH"
 
+          # GITHUB_ENV so vale para os proximos steps. O export e necessario
+          # para que o kubectl deste mesmo step use o arquivo recem-criado.
+          export KUBECONFIG="$KUBECONFIG_PATH"
+
           echo "KUBECONFIG=$KUBECONFIG_PATH" >> "$GITHUB_ENV"
           echo "EKS_CLUSTER_NAME=$EKS_CLUSTER_NAME" >> "$GITHUB_ENV"
 
@@ -220,10 +224,25 @@ jobs:
             --name "$EKS_CLUSTER_NAME" \
             --region "$AWS_REGION" \
             --alias oficina360 \
-            --kubeconfig "$KUBECONFIG_PATH" \
+            --kubeconfig "$KUBECONFIG" \
             >/dev/null
 
-          kubectl auth can-i get namespaces >/dev/null
+          test -s "$KUBECONFIG" || {
+            echo "::error::O kubeconfig nao foi criado."
+            exit 1
+          }
+
+          CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
+          [[ "$CURRENT_CONTEXT" == "oficina360" ]] || {
+            echo "::error::O contexto Kubernetes esperado nao foi ativado."
+            exit 1
+          }
+
+          if ! kubectl --request-timeout=20s auth can-i get namespaces >/dev/null; then
+            echo "::error::Nao foi possivel autenticar no cluster EKS."
+            exit 1
+          fi
+
           echo "Acesso ao cluster configurado."
 
       - name: Verificar permissoes Kubernetes
