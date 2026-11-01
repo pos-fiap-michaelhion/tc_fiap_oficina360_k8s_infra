@@ -21,46 +21,125 @@ concurrency:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-  CLUSTER_NAME: oficina360
+  PROJECT_NAME: oficina360
+  ENVIRONMENT: lab
+  KONG_NAMESPACE: kong
+  KONG_RELEASE: kong
 
 jobs:
   kong:
+    name: Kong ${{ inputs.action }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
 
       - name: Configurar repositorio Helm
         run: |
-          helm repo add kong https://charts.konghq.com --force-update
-          helm repo update
+          set -euo pipefail
+          helm repo add kong https://charts.konghq.com --force-update >/dev/null
+          helm repo update >/dev/null
+          echo "Repositorio Helm configurado."
 
       - name: Validar chart e Ingress
         if: inputs.action == 'validate'
         run: |
           set -euo pipefail
-          helm template kong kong/kong \
-            --namespace kong \
-            -f k8s/kong/values.yaml >/tmp/kong.yaml
-          test -s /tmp/kong.yaml
+
+          helm template "$KONG_RELEASE" kong/kong \
+            --namespace "$KONG_NAMESPACE" \
+            -f k8s/kong/values.yaml \
+            > /tmp/kong-rendered.yaml
+
+          test -s /tmp/kong-rendered.yaml
           test -s k8s/kong/api-ingress.yaml
 
-      - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+          echo "Chart e Ingress validados."
+
+      - name: Configurar credenciais AWS
         if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Configurar acesso ao EKS
-        env:
-          EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+      - name: Validar identidade AWS sem expor dados
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
         run: |
           set -euo pipefail
 
-          : "${EKS_CLUSTER_NAME:?Repository Variable EKS_CLUSTER_NAME nao definida}"
+          IDENTITY_JSON="$(aws sts get-caller-identity --output json)"
+          ACCOUNT_ID="$(jq -r '.Account' <<< "$IDENTITY_JSON")"
+          CALLER_ARN="$(jq -r '.Arn' <<< "$IDENTITY_JSON")"
+          USER_ID="$(jq -r '.UserId' <<< "$IDENTITY_JSON")"
+
+          : "${ACCOUNT_ID:?Conta AWS nao identificada}"
+          : "${CALLER_ARN:?Caller ARN nao identificado}"
+          : "${USER_ID:?User ID nao identificado}"
+
+          echo "::add-mask::$ACCOUNT_ID"
+          echo "::add-mask::$CALLER_ARN"
+          echo "::add-mask::$USER_ID"
+          echo "::add-mask::${CALLER_ARN##*/}"
+
+          echo "Identidade AWS validada."
+
+      - name: Descobrir e configurar cluster EKS atual
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        run: |
+          set -euo pipefail
+
+          mapfile -t CLUSTERS < <(
+            aws eks list-clusters \
+              --region "$AWS_REGION" \
+              --query 'clusters[]' \
+              --output text |
+            tr '\t' '\n' |
+            sed '/^$/d'
+          )
+
+          [[ "${#CLUSTERS[@]}" -gt 0 ]] || {
+            echo "::error::Nenhum cluster EKS encontrado na regiao configurada."
+            exit 1
+          }
+
+          CANDIDATES=()
+
+          for cluster_name in "${CLUSTERS[@]}"; do
+            CLUSTER_JSON="$(
+              aws eks describe-cluster \
+                --name "$cluster_name" \
+                --region "$AWS_REGION" \
+                --output json
+            )"
+
+            CLUSTER_PROJECT="$(jq -r '.cluster.tags.Project // empty' <<< "$CLUSTER_JSON")"
+            CLUSTER_ENVIRONMENT="$(jq -r '.cluster.tags.Environment // empty' <<< "$CLUSTER_JSON")"
+
+            if [[ "$cluster_name" == "$PROJECT_NAME" ]] ||
+               [[ "$CLUSTER_PROJECT" == "$PROJECT_NAME" && "$CLUSTER_ENVIRONMENT" == "$ENVIRONMENT" ]]; then
+              CANDIDATES+=("$cluster_name")
+            fi
+          done
+
+          if [[ "${#CANDIDATES[@]}" -eq 0 && "${#CLUSTERS[@]}" -eq 1 ]]; then
+            CANDIDATES=("${CLUSTERS[0]}")
+          fi
+
+          [[ "${#CANDIDATES[@]}" -eq 1 ]] || {
+            echo "::error::Nao foi possivel selecionar um unico cluster EKS."
+            exit 1
+          }
+
+          EKS_CLUSTER_NAME="${CANDIDATES[0]}"
+          echo "::add-mask::$EKS_CLUSTER_NAME"
 
           CLUSTER_STATUS="$(
             aws eks describe-cluster \
@@ -70,68 +149,212 @@ jobs:
               --output text
           )"
 
-          if [[ "$CLUSTER_STATUS" != "ACTIVE" ]]; then
-            echo "::error::Cluster EKS nao esta ACTIVE. Status: $CLUSTER_STATUS"
+          [[ "$CLUSTER_STATUS" == "ACTIVE" ]] || {
+            echo "::error::O cluster EKS nao esta ACTIVE."
             exit 1
-          fi
+          }
 
-          export KUBECONFIG="$RUNNER_TEMP/oficina360-kubeconfig"
-          rm -f "$KUBECONFIG"
-          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
+          KUBECONFIG_PATH="$RUNNER_TEMP/oficina360-kubeconfig"
+          rm -f "$KUBECONFIG_PATH"
+
+          echo "KUBECONFIG=$KUBECONFIG_PATH" >> "$GITHUB_ENV"
+          echo "EKS_CLUSTER_NAME=$EKS_CLUSTER_NAME" >> "$GITHUB_ENV"
 
           aws eks update-kubeconfig \
             --name "$EKS_CLUSTER_NAME" \
             --region "$AWS_REGION" \
             --alias oficina360 \
-            --kubeconfig "$KUBECONFIG"
+            --kubeconfig "$KUBECONFIG_PATH" \
+            >/dev/null
 
-          kubectl config current-context
-          kubectl cluster-info
-          kubectl get nodes
-      - name: Deploy
+          kubectl auth can-i get namespaces >/dev/null
+          echo "Acesso ao cluster configurado."
+
+      - name: Verificar permissoes Kubernetes
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        run: |
+          set -euo pipefail
+
+          kubectl auth can-i get namespaces >/dev/null
+
+          if [[ "${{ inputs.action }}" == "deploy" ]]; then
+            kubectl auth can-i create namespaces >/dev/null
+            kubectl auth can-i create deployments --namespace "$KONG_NAMESPACE" >/dev/null
+            kubectl auth can-i create services --namespace "$KONG_NAMESPACE" >/dev/null
+          fi
+
+          echo "Permissoes Kubernetes validadas."
+
+      - name: Deploy Kong
         if: inputs.action == 'deploy'
         run: |
           set -euo pipefail
-          kubectl create namespace kong \
-            --dry-run=client -o yaml | kubectl apply -f -
 
-          helm upgrade --install kong kong/kong \
-            --namespace kong \
+          kubectl create namespace "$KONG_NAMESPACE" \
+            --dry-run=client \
+            --output yaml |
+            kubectl apply -f - >/dev/null
+
+          helm upgrade --install "$KONG_RELEASE" kong/kong \
+            --namespace "$KONG_NAMESPACE" \
             -f k8s/kong/values.yaml \
-            --wait --timeout 10m
+            --wait \
+            --timeout 10m \
+            --hide-notes
 
-          kubectl apply -f k8s/kong/api-ingress.yaml
-          kubectl get pods -n kong
-          kubectl get svc -n kong
+          kubectl apply -f k8s/kong/api-ingress.yaml >/dev/null
 
-      - name: Destroy
+          kubectl rollout status \
+            deployment/kong-kong \
+            --namespace "$KONG_NAMESPACE" \
+            --timeout=5m
+
+          echo "Kong implantado com sucesso."
+
+      - name: Verificar deploy Kong
+        if: inputs.action == 'deploy'
+        run: |
+          set -euo pipefail
+
+          READY_REPLICAS="$(
+            kubectl get deployment kong-kong \
+              --namespace "$KONG_NAMESPACE" \
+              --output jsonpath='{.status.readyReplicas}' 2>/dev/null ||
+            echo 0
+          )"
+
+          AVAILABLE_REPLICAS="$(
+            kubectl get deployment kong-kong \
+              --namespace "$KONG_NAMESPACE" \
+              --output jsonpath='{.status.availableReplicas}' 2>/dev/null ||
+            echo 0
+          )"
+
+          [[ "${READY_REPLICAS:-0}" -ge 1 ]] || {
+            echo "::error::Kong sem replicas prontas."
+            exit 1
+          }
+
+          [[ "${AVAILABLE_REPLICAS:-0}" -ge 1 ]] || {
+            echo "::error::Kong sem replicas disponiveis."
+            exit 1
+          }
+
+          kubectl get ingress \
+            --namespace oficina360 \
+            --no-headers \
+            >/dev/null 2>&1 || {
+              echo "::error::Ingress da aplicacao nao encontrado."
+              exit 1
+            }
+
+          echo "Deploy Kong validado."
+          echo "Replicas prontas: $READY_REPLICAS"
+          echo "Replicas disponiveis: $AVAILABLE_REPLICAS"
+
+      - name: Destroy Kong
         if: inputs.action == 'destroy'
         run: |
+          set -euo pipefail
+
           kubectl delete -f k8s/kong/api-ingress.yaml \
-            --ignore-not-found=true || true
-          helm uninstall kong -n kong || true
-          kubectl delete namespace kong --ignore-not-found=true || true
+            --ignore-not-found=true \
+            >/dev/null 2>&1 || true
 
-      - name: Diagnostico
-        if: always() && inputs.action != 'validate'
+          helm uninstall "$KONG_RELEASE" \
+            --namespace "$KONG_NAMESPACE" \
+            --wait \
+            >/dev/null 2>&1 || true
+
+          kubectl delete namespace "$KONG_NAMESPACE" \
+            --ignore-not-found=true \
+            --wait=true \
+            --timeout=5m \
+            >/dev/null
+
+          if kubectl get namespace "$KONG_NAMESPACE" >/dev/null 2>&1; then
+            echo "::error::Namespace Kong ainda existe."
+            exit 1
+          fi
+
+          echo "Kong removido."
+
+      - name: Gerar diagnostico sanitizado
+        if: failure() && inputs.action != 'validate'
         run: |
-          {
-            echo "===== RELEASES ====="
-            helm list -n kong || true
-            echo
-            echo "===== PODS ====="
-            kubectl get pods -n kong -o wide || true
-            echo
-            echo "===== SERVICES ====="
-            kubectl get svc -n kong || true
-            echo
-            echo "===== EVENTS ====="
-            kubectl get events -n kong --sort-by=.lastTimestamp || true
-          } > kong-diagnostics.txt 2>&1
+          set -euo pipefail
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: always() && inputs.action != 'validate'
+          NAMESPACE_EXISTS="false"
+          RELEASE_EXISTS="false"
+          DEPLOYMENT_EXISTS="false"
+          READY_REPLICAS="0"
+          AVAILABLE_REPLICAS="0"
+          POD_COUNT="0"
+          FAILED_POD_COUNT="0"
+
+          if kubectl get namespace "$KONG_NAMESPACE" >/dev/null 2>&1; then
+            NAMESPACE_EXISTS="true"
+          fi
+
+          if helm status "$KONG_RELEASE" \
+            --namespace "$KONG_NAMESPACE" \
+            >/dev/null 2>&1; then
+            RELEASE_EXISTS="true"
+          fi
+
+          if kubectl get deployment kong-kong \
+            --namespace "$KONG_NAMESPACE" \
+            >/dev/null 2>&1; then
+
+            DEPLOYMENT_EXISTS="true"
+            READY_REPLICAS="$(
+              kubectl get deployment kong-kong \
+                --namespace "$KONG_NAMESPACE" \
+                --output jsonpath='{.status.readyReplicas}' 2>/dev/null ||
+              echo 0
+            )"
+            AVAILABLE_REPLICAS="$(
+              kubectl get deployment kong-kong \
+                --namespace "$KONG_NAMESPACE" \
+                --output jsonpath='{.status.availableReplicas}' 2>/dev/null ||
+              echo 0
+            )"
+          fi
+
+          POD_COUNT="$(
+            kubectl get pods \
+              --namespace "$KONG_NAMESPACE" \
+              --no-headers 2>/dev/null |
+            wc -l |
+            tr -d ' '
+          )"
+
+          FAILED_POD_COUNT="$(
+            kubectl get pods \
+              --namespace "$KONG_NAMESPACE" \
+              --field-selector=status.phase=Failed \
+              --no-headers 2>/dev/null |
+            wc -l |
+            tr -d ' '
+          )"
+
+          {
+            echo "status=failure"
+            echo "action=${{ inputs.action }}"
+            echo "namespace_exists=$NAMESPACE_EXISTS"
+            echo "release_exists=$RELEASE_EXISTS"
+            echo "deployment_exists=$DEPLOYMENT_EXISTS"
+            echo "ready_replicas=${READY_REPLICAS:-0}"
+            echo "available_replicas=${AVAILABLE_REPLICAS:-0}"
+            echo "pod_count=${POD_COUNT:-0}"
+            echo "failed_pod_count=${FAILED_POD_COUNT:-0}"
+          } > kong-diagnostics.txt
+
+      - name: Publicar diagnostico sanitizado
+        if: failure() && inputs.action != 'validate'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: kong-diagnostics
           path: kong-diagnostics.txt
+          if-no-files-found: warn
           retention-days: 1
