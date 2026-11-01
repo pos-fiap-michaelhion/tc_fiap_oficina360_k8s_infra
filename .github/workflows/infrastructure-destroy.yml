@@ -169,22 +169,40 @@ jobs:
           echo "VPC_ID=$VPC_ID" >> "$GITHUB_ENV"
           echo "VPC encontrada: $VPC_ID"
 
-      - name: Configurar cluster sem DescribeCluster
-        timeout-minutes: 3
-        working-directory: .
+      - name: Configurar acesso ao EKS
         env:
           EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
-          EKS_CLUSTER_ENDPOINT: ${{ vars.EKS_CLUSTER_ENDPOINT }}
-          EKS_CLUSTER_CA: ${{ vars.EKS_CLUSTER_CA }}
         run: |
           set -euo pipefail
 
           : "${EKS_CLUSTER_NAME:?Repository Variable EKS_CLUSTER_NAME nao definida}"
-          : "${EKS_CLUSTER_ENDPOINT:?Repository Variable EKS_CLUSTER_ENDPOINT nao definida}"
-          : "${EKS_CLUSTER_CA:?Repository Variable EKS_CLUSTER_CA nao definida}"
 
-          bash scripts/configure-eks-kubeconfig.sh
+          CLUSTER_STATUS="$(
+            aws eks describe-cluster \
+              --name "$EKS_CLUSTER_NAME" \
+              --region "$AWS_REGION" \
+              --query 'cluster.status' \
+              --output text
+          )"
 
+          if [[ "$CLUSTER_STATUS" != "ACTIVE" ]]; then
+            echo "::error::Cluster EKS nao esta ACTIVE. Status: $CLUSTER_STATUS"
+            exit 1
+          fi
+
+          export KUBECONFIG="$RUNNER_TEMP/oficina360-kubeconfig"
+          rm -f "$KUBECONFIG"
+          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
+
+          aws eks update-kubeconfig \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION" \
+            --alias oficina360 \
+            --kubeconfig "$KUBECONFIG"
+
+          kubectl config current-context
+          kubectl cluster-info
+          kubectl get nodes
       - name: Remover releases Helm
         timeout-minutes: 15
         working-directory: .
