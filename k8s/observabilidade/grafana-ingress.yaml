@@ -4,7 +4,7 @@ metadata:
   name: grafana
   namespace: observability
   annotations:
-    konghq.com/strip-path: "false"
+    konghq.com/strip-path: "true"
 
 spec:
   ingressClassName: kong
