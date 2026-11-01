@@ -17,3 +17,10 @@ spec:
                 name: oficina360-api
                 port:
                   number: 8080
+          - path: /auth
+            pathType: Prefix
+            backend:
+              service:
+                name: oficina360-auth-lambda
+                port:
+                  number: 443

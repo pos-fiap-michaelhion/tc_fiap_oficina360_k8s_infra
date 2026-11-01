@@ -1,10 +1,9 @@
 replicas: 1
 
 service:
-  type: LoadBalancer
+  type: ClusterIP
   port: 80
-  loadBalancerSourceRanges:
-    - "0.0.0.0/0"
+  targetPort: 3000
 
 persistence:
   enabled: false
@@ -31,3 +30,9 @@ datasources:
         url: http://loki-gateway.observability.svc.cluster.local
         isDefault: true
         editable: false
+
+grafana.ini:
+  server:
+    domain: localhost
+    root_url: "%(protocol)s://%(domain)s/grafana/"
+    serve_from_sub_path: true
