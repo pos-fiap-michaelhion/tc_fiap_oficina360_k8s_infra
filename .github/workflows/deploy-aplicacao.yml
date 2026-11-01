@@ -54,7 +54,7 @@ jobs:
           : "${IMAGE:?Nenhuma imagem foi informada e DEFAULT_APP_IMAGE nao esta definida}"
 
           if [[ "$IMAGE" =~ [[:space:]] ]]; then
-            echo "::error::Informe somente a referencia da imagem, sem 'docker pull' ou espacos."
+            echo "::error::Informe somente a referencia da imagem, sem docker pull ou espacos."
             exit 1
           fi
 
@@ -128,6 +128,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Configurar acesso ao EKS
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
         env:
           EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
         run: |
@@ -150,7 +151,6 @@ jobs:
 
           export KUBECONFIG="$RUNNER_TEMP/oficina360-kubeconfig"
           rm -f "$KUBECONFIG"
-
           echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
 
           aws eks update-kubeconfig \
@@ -180,9 +180,7 @@ jobs:
       - name: Deploy
         if: inputs.action == 'deploy'
         env:
-          DB_HOST: ${{ vars.DB_HOST }}
-          DB_PORT: ${{ vars.DB_PORT }}
-          DB_NAME: ${{ vars.DB_NAME }}
+          DATABASE_URL: ${{ vars.DATABASE_URL }}
           DB_USERNAME: ${{ secrets.DB_USERNAME }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
@@ -191,12 +189,27 @@ jobs:
 
           : "${IMAGE:?Imagem resolvida nao encontrada}"
           : "${IMAGE_MODE:?Modo da imagem nao encontrado}"
-          : "${DB_HOST:?Repository Variable DB_HOST nao definida}"
-          : "${DB_PORT:?Repository Variable DB_PORT nao definida}"
-          : "${DB_NAME:?Repository Variable DB_NAME nao definida}"
+          : "${DATABASE_URL:?Repository Variable DATABASE_URL nao definida}"
           : "${DB_USERNAME:?GitHub Secret DB_USERNAME nao definido}"
           : "${DB_PASSWORD:?GitHub Secret DB_PASSWORD nao definido}"
           : "${JWT_SECRET:?GitHub Secret JWT_SECRET nao definido}"
+
+          if [[ ! "$DATABASE_URL" =~ ^jdbc:postgresql://([^/:]+):([0-9]+)/([^/?]+)$ ]]; then
+            echo "::error::DATABASE_URL deve usar jdbc:postgresql://host:porta/banco"
+            exit 1
+          fi
+
+          DATABASE_HOST="${BASH_REMATCH[1]}"
+          DATABASE_PORT="${BASH_REMATCH[2]}"
+          DATABASE_NAME="${BASH_REMATCH[3]}"
+
+          echo "::add-mask::$DB_USERNAME"
+          echo "::add-mask::$DB_PASSWORD"
+
+          echo "Banco configurado:"
+          echo "Host: $DATABASE_HOST"
+          echo "Porta: $DATABASE_PORT"
+          echo "Database: $DATABASE_NAME"
 
           kubectl apply -f k8s/aws/namespace.yaml
           kubectl get namespace "$NAMESPACE"
