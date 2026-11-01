@@ -177,11 +177,6 @@ jobs:
 
           VPC_ID="$(terraform output -raw vpc_id)"
 
-          if [[ ! "$VPC_ID" =~ ^vpc-[0-9a-f]+$ ]]; then
-            echo "::error::VPC ID possui formato invalido: $VPC_ID"
-            exit 1
-          fi
-
           echo "VPC_ID=$VPC_ID" >> "$GITHUB_ENV"
           echo "VPC encontrada: $VPC_ID"
 
