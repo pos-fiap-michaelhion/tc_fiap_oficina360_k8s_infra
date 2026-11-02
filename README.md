@@ -8,6 +8,31 @@ Infraestrutura como código da Oficina360 para o laboratório da Fase 3.
 
 ---
 ## Arquitetura
+````mermaid
+flowchart LR
+Client[Postman / Cliente] --> Kong[Kong API Gateway]
+
+    Kong -->|/auth| APIGW[AWS API Gateway]
+    APIGW --> Lambda[Lambda de autenticação]
+
+    Kong -->|/api| API[API Oficina360]
+    API --> RDS["(PostgreSQL no RDS)"]
+
+    Lambda --> RDS
+    Lambda -->|Gera JWT| Client
+    Client -->|Bearer JWT| Kong
+
+    subgraph EKS[Amazon EKS]
+        Kong
+        API
+        Alloy[Grafana Alloy]
+    end
+
+    API -->|stdout| Alloy
+    Kong -->|stdout| Alloy
+    Alloy --> Loki[Grafana Loki]
+    Grafana[Grafana] --> Loki
+````
 
 ```text
 Internet
@@ -25,6 +50,49 @@ Alloy -> Loki -> Grafana
           todos no mesmo EKS, em namespaces separados
 ```
 
+## Fluxo de autenticação
+````mermaid
+sequenceDiagram
+    actor Cliente
+    participant Kong
+    participant APIGateway as AWS API Gateway
+    participant Lambda
+    participant RDS
+    participant API as API Oficina360
+
+    Cliente->>Kong: POST /auth/auth
+    Kong->>APIGateway: POST /Prod/auth
+    APIGateway->>Lambda: Executa autenticação
+    Lambda->>Lambda: Valida CPF/documento
+    Lambda->>RDS: Consulta cliente e status
+    RDS-->>Lambda: Dados do cliente
+    Lambda-->>Cliente: JWT
+
+    Cliente->>Kong: GET /api/servicos/listar + JWT
+    Kong->>API: GET /servicos/listar + JWT
+    API->>API: Valida assinatura, issuer e expiração
+    API->>RDS: Consulta serviços
+    RDS-->>API: Resultado
+    API-->>Cliente: HTTP 200
+````
+## Fluxo ci/cd
+
+````mermaid
+flowchart TD
+    PR[Pull Request] --> Checks[Testes e validações]
+    Checks --> Security[Análise de segurança]
+    Security --> Main[Merge na branch main]
+
+    Main --> Terraform[Terraform plan e apply]
+    Main --> Build[Build da aplicação]
+    Build --> Image[Imagem Docker]
+    Image --> Registry[Docker Hub / Registry]
+    Registry --> Deploy[Deploy no EKS]
+
+    Terraform --> AWS[AWS]
+    Deploy --> Rollout[Rollout Kubernetes]
+    Rollout --> Validation[Validação de disponibilidade]
+````
 ## Responsabilidades deste repositório
 
 - Terraform: VPC, EKS, node group, RDS e Security Groups.
