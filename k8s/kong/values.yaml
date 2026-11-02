@@ -1,10 +1,20 @@
 env:
-  database: "off"
+  log_level: info
 
-# O Kong e a entrada publica da API, entao o LoadBalancer fica aberto para a
-# internet. Para restringir, use proxy.loadBalancerSourceRanges (nao a raiz).
+  proxy_access_log: /dev/stdout
+  proxy_error_log: /dev/stderr
+
+  admin_access_log: /dev/stdout
+  admin_error_log: /dev/stderr
+
+  status_access_log: "off"
+
 proxy:
-  type: LoadBalancer
-
-ingressController:
   enabled: true
+
+admin:
+  enabled: false
+
+status:
+  enabled: true
+
